@@ -1,0 +1,11 @@
+/build/
+/package/
+/reports/
+/dist/
+/backups/
+**/obj*/
+**/__pycache__/
+*.pyc
+*.user
+*.suo
+/.vs/
