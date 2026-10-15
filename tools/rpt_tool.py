@@ -382,7 +382,7 @@ def cmd_package():
                          "\n[diagnostics]\nenabled=0\n")
     manifest = {
         "schema_version": 1,
-        "version": "0.2.1",
+        "version": open(os.path.join(ROOT, "VERSION"), encoding="ascii").read().strip(),
         "dll_sha256": sha256_file(dst),
         "dll_size": os.path.getsize(dst),
         "ini_sha256": sha256_file(ini),

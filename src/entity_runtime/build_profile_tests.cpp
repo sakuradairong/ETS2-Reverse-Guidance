@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <array>
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -54,15 +57,11 @@ int main(int argc, char **argv)
 {
     constexpr std::size_t image_size = 0x01600000;
     std::vector<std::uint8_t> image(image_size, 0xcc);
-    for (const auto &hook : verified_160_1_7_hooks)
-        std::copy(hook.signature.begin(), hook.signature.end(),
-                  image.begin() + hook.rva);
-    for (const auto &hook : verified_161_1_1_hooks)
-        std::copy(hook.signature.begin(), hook.signature.end(),
-                  image.begin() + hook.rva);
-    for (const auto &hook : verified_161_1_0_hooks)
-        std::copy(hook.signature.begin(), hook.signature.end(),
-                  image.begin() + hook.rva);
+    for (const auto &profile : build_profiles)
+        for (const auto &hook : profile.enabled_hooks)
+            std::copy(hook.signature.begin(), hook.signature.end(), image.begin() + hook.rva);
+    for (const auto &helper : verified_161_1_9_model_helpers)
+        std::copy(helper.signature.begin(), helper.signature.end(), image.begin() + helper.rva);
 
     const auto reader = [&](std::uintptr_t rva, const std::uint8_t *bytes,
                             std::size_t size) {
@@ -72,31 +71,45 @@ int main(int argc, char **argv)
 
     bool exact = false;
     std::size_t failed = 99;
-    const auto *public_build = select_build_profile(
-        build_profiles[2].executable_sha256, reader, &exact, &failed);
-    assert(public_build == &build_profiles[2]);
-    assert(exact);
-
-    const auto *new_public_build = select_build_profile(
-        build_profiles[0].executable_sha256, reader, &exact, &failed);
-    assert(new_public_build == &build_profiles[0] && exact);
-
-    const auto *previous_public_build = select_build_profile(
-        build_profiles[1].executable_sha256, reader, &exact, &failed);
-    assert(previous_public_build == &build_profiles[1] && exact);
+    for (const auto &profile : build_profiles)
+    {
+        if (profile.executable_sha256.empty()) continue;
+        assert(select_build_profile(profile.executable_sha256, reader, &exact, &failed) == &profile);
+        assert(exact);
+        for (const auto &hook : profile.enabled_hooks)
+        {
+            image[hook.rva] ^= 0xff;
+            assert(select_build_profile(profile.executable_sha256, reader, &exact, &failed) == nullptr);
+            image[hook.rva] ^= 0xff;
+        }
+    }
+    assert(model_helpers_161_1_9_match(reader));
+    for (const auto &helper : verified_161_1_9_model_helpers)
+    {
+        image[helper.rva + helper.signature.size() - 1] ^= 0xff;
+        assert(!model_helpers_161_1_9_match(reader));
+        image[helper.rva + helper.signature.size() - 1] ^= 0xff;
+    }
+    // A newer layout must not become an unrestricted signature-only fallback.
+    const auto new_only_reader = [&](std::uintptr_t rva, const std::uint8_t *bytes, std::size_t size) {
+        for (const auto &hook : verified_161_1_9_hooks)
+            if (rva == hook.rva) return reader(rva, bytes, size);
+        return false;
+    };
+    assert(select_build_profile("UNKNOWN-NEW-BUILD", new_only_reader, &exact, &failed) == nullptr);
 
     // A second binary digest is supported by the separately declared
     // signature-compatible profile when all enabled hooks remain verified.
     const auto *compatible_build = select_build_profile(
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         reader, &exact, &failed);
-    assert(compatible_build == &build_profiles[3]);
+    assert(compatible_build == &build_profiles[4]);
     assert(!exact);
 
     // Bytes at an old, inactive lifecycle helper are intentionally irrelevant.
     image[0x015288d0] ^= 0xff;
     compatible_build = select_build_profile("SECOND-BUILD", reader, &exact, &failed);
-    assert(compatible_build == &build_profiles[3]);
+    assert(compatible_build == &build_profiles[4]);
 
     // Any mismatch in an actually enabled hook causes safe rejection.
     const auto &required = verified_160_1_7_hooks[2];
@@ -104,8 +117,8 @@ int main(int argc, char **argv)
     assert(select_build_profile("UNSUPPORTED", reader, &exact, &failed) == nullptr);
     assert(failed == 2);
 
-    std::cout << "build profile tests passed: 1.60, 1.61.1.0, 1.61.1.1 exact profiles + compatible profile; "
-                 "inactive hook ignored; required mismatch rejected\n";
+    std::cout << "build profile tests passed: 1.60, 1.61.1.0, 1.61.1.1, 1.61.1.9 exact profiles + legacy fallback; "
+                 "all hook/helper mutations rejected; unknown-new hash rejected\n";
 
     if (argc == 3)
     {
@@ -121,7 +134,11 @@ int main(int argc, char **argv)
             };
         const auto *exact_file = select_build_profile(
             argv[2], file_reader, &exact, &failed);
-        assert(exact_file == &build_profiles[0] && exact);
+        assert(exact_file && exact);
+        if (exact_file->game_version == "1.61.1.9")
+            assert(model_helpers_161_1_9_match(file_reader));
+        const auto *dispatch = find_hook(*exact_file, HookId::vehicle_render_dispatch);
+        assert(dispatch);
         // The selected entry must dispatch both trailer and tractor virtual
         // render methods. A similar prologue in a serializer passed a shorter
         // byte-pattern check but was never called in the driving scene.
@@ -129,11 +146,11 @@ int main(int argc, char **argv)
             0x48, 0x8b, 0x8e, 0xc8, 0x00, 0x00, 0x00};
         const std::array<std::uint8_t, 6> virtual_render{
             0xff, 0x90, 0x00, 0x03, 0x00, 0x00};
-        assert(file_signature_matches(executable, 0x00798801,
+        assert(file_signature_matches(executable, dispatch->rva + 0xe1,
                                       trailer_member.data(), trailer_member.size()));
-        assert(file_signature_matches(executable, 0x0079881a,
+        assert(file_signature_matches(executable, dispatch->rva + 0xfa,
                                       virtual_render.data(), virtual_render.size()));
-        assert(file_signature_matches(executable, 0x007988ab,
+        assert(file_signature_matches(executable, dispatch->rva + 0x18b,
                                       virtual_render.data(), virtual_render.size()));
         std::cout << "installed executable verified: " << argv[1]
                   << "; exact=" << exact_file->id

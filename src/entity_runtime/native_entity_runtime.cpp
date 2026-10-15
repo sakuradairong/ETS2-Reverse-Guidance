@@ -1817,14 +1817,26 @@ bool initialize_engine()
     }
     const bool is_161 = active_build_profile->game_version.rfind("1.61.", 0) == 0;
     const bool is_161_1_1 = active_build_profile->game_version == "1.61.1.1";
+    const bool is_161_1_9 = active_build_profile->game_version == "1.61.1.9";
+    const auto &new_helpers = reverse_assist::compatibility::verified_161_1_9_model_helpers;
     const auto model_transfer_161_compat_rva =
+        is_161_1_9 ? new_helpers[0].rva :
         is_161_1_1 ? model_transfer_161_1_1_rva : model_transfer_161_rva;
     const auto model_parameter_init_161_compat_rva =
+        is_161_1_9 ? new_helpers[1].rva :
         is_161_1_1 ? model_parameter_init_161_1_1_rva : model_parameter_init_161_rva;
     const auto set_parent_161_compat_rva =
+        is_161_1_9 ? new_helpers[2].rva :
         is_161_1_1 ? set_parent_161_1_1_rva : set_parent_161_rva;
     const auto set_transform_161_compat_rva =
+        is_161_1_9 ? new_helpers[3].rva :
         is_161_1_1 ? set_transform_161_1_1_rva : set_transform_161_rva;
+    if (is_161_1_9 &&
+        !reverse_assist::compatibility::model_helpers_161_1_9_match(signature_reader))
+    {
+        log_line("[reverse-entity] Compatibility disabled: 1.61.1.9 model helpers changed; telemetry-only mode active.", SCS_LOG_TYPE_warning);
+        return false;
+    }
     if (is_161 &&
         !(signature_reader(model_transfer_161_compat_rva,
                            reinterpret_cast<const std::uint8_t *>("\x48\x89\x5c\x24\x08\x48\x89\x74"), 8) &&
@@ -1910,7 +1922,7 @@ bool initialize_engine()
     log_line("[reverse-entity] Compatibility checks passed for every enabled hook; native entity backend ready.");
     if (trace_all_model_loads && guidance_options.diagnostics)
         log_line("[reverse-entity] Model-path tracing enabled; independent render-model pool available.");
-    log_line("[reverse-entity] Reverse guidance v0.2.1 ready: enabled=" +
+    log_line("[reverse-entity] Reverse guidance v0.2.2 ready: enabled=" +
              std::to_string(guidance_options.enabled) + "; endpoint=" +
              std::to_string(guidance_options.endpoint_outline) + "; front_swing=" +
              std::to_string(guidance_options.front_swing) + "; articulation=" +
@@ -2199,7 +2211,7 @@ bool unsafe_render_independent_prediction_frames(std::uint64_t render_context)
     if (frames.count != 0 && !logged_independent_frame_models.exchange(true, std::memory_order_relaxed))
     {
         log_line("[reverse-entity] Created independent render-only prediction models; active poses=" +
-                 std::to_string(frames.count) + "; guidance v0.2.1.");
+                 std::to_string(frames.count) + "; guidance v0.2.2.");
     }
     if (frames.count != 0 && !logged_independent_frame_render.exchange(true, std::memory_order_relaxed))
         log_line("[reverse-entity] Tractor-side independent swept-area rendering is active.");

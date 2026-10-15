@@ -1,4 +1,4 @@
-param([switch]$NoPackage)
+param([switch]$NoPackage, [string]$GameExecutable)
 $ErrorActionPreference = 'Stop'
 $buildRoot = $PSScriptRoot
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -17,6 +17,12 @@ try {
     foreach ($test in @('build/guidance_tests/GuidanceTests.exe', 'build/entity_runtime_tests/BuildProfileTests.exe')) {
         & "./$test"
         if ($LASTEXITCODE -ne 0) { throw "$test failed." }
+    }
+    if ($GameExecutable) {
+        $gamePath = (Resolve-Path -LiteralPath $GameExecutable).Path
+        $gameHash = (Get-FileHash -LiteralPath $gamePath -Algorithm SHA256).Hash
+        & './build/entity_runtime_tests/BuildProfileTests.exe' $gamePath $gameHash
+        if ($LASTEXITCODE -ne 0) { throw 'Installed game executable compatibility checks failed.' }
     }
     & $python tools/rpt_tool.py package
     if ($LASTEXITCODE -ne 0) { throw 'Plugin packaging failed.' }
