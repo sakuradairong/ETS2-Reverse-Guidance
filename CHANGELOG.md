@@ -5,8 +5,9 @@
 - Keep unsupported builds in telemetry-only mode and keep legacy accessory mutation unavailable on 1.62.
 - Wire `trailer_corridor`, `corridor_distance_cm`, `session_latch`, `jackknife_cues`, and `[target] allow_pullup` into INI configuration and runtime caching, and pass measured `TrailerSpec` into `build_reverse_guidance` for accurate jackknife critical angles.
 - Add forward pull-up visualization (`build_pullup_guidance` + `ReverseSessionLatch`) and non-target real-time jackknife recovery cues reusing existing baked cue assets.
-- Upgrade `ReversePlanner` and `ReverseTarget` with optional 1-pull-up bidirectional Hybrid A*, feedback-linearized closed-loop steering tracking, Alt coarse positioning (`2.0 m / 15 deg`), and semantic layered 256-segment budget merging.
-- Extend offline unit tests (`GuidanceTests`: 37,346 checks; `PlannerTests`: 5,166 checks) and `BuildProfileTests` coverage for 1.62.1.0 / 1.62.3.3 helpers and vtable methods; Windows MSVC DLL compilation and in-game ETS2 acceptance remain pending.
+- Upgrade `ReversePlanner` and `ReverseTarget` with bidirectional Hybrid A* (`max_gear_changes=2`, target-rear-frame heuristic, 8 m closed-loop Analytic Terminal Shot), real `int gear` overload (supporting ≤8 km/h forward pull-up legs and neutral switch-point hold), deadband feedback-linearized closed-loop steering tracking, `GuideStyle::preview` gear-change cross markers, Alt coarse positioning (`2.0 m / 15 deg`), and semantic layered 256-segment budget merging.
+- Add standalone visual enhancement pack `assets_improved/` (`64x64` BGRA8 core-lit feathered `.dds` textures + unified day/night `.mat` luminance), reproducible generator `tools/build_visual_assets.py`, and backup/rollback installer `Install-VisualAssets.ps1`.
+- Extend offline unit tests (`GuidanceTests`, `PlannerTests`, `BuildProfileTests`) and verify Windows MSVC CI build (`Build.ps1`); in-game ETS2 1.62.3.3 acceptance remains pending.
 
 ## 0.3.0-preview.4
 
