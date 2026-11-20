@@ -36,6 +36,10 @@ def main():
     stage.mkdir(parents=True)
     for directory in ("plugins", "home"):
         shutil.copytree(package / directory, stage / directory)
+    if (ROOT / "assets_improved").is_dir():
+        shutil.copytree(ROOT / "assets_improved", stage / "assets_improved")
+    if (ROOT / "Install-VisualAssets.ps1").is_file():
+        shutil.copy2(ROOT / "Install-VisualAssets.ps1", stage / "Install-VisualAssets.ps1")
     for file in ("README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "VERSION"):
         shutil.copy2(ROOT / file, stage / file)
     shutil.copy2(package / "manifest.json", stage / "manifest.json")

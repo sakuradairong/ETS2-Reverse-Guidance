@@ -1,4 +1,4 @@
-# ETS2 Reverse Guidance v0.3.0-preview.5
+# ETS2 Reverse Guidance v0.3.0-beta.1
 
 欧卡 2 的 Windows x64 倒车轨迹辅助。基于 [yyysheng 的 ETS2 Reverse Posture Assistant v0.11.1](https://github.com/yyysheng/ETS2mods/tree/reverse-posture-assistant-v0.11.1/mods/ETS2_Reverse_Posture_Assistant)，以 MIT 许可证公开项目源码。
 

@@ -1974,7 +1974,7 @@ bool initialize_engine()
     log_line("[reverse-entity] Compatibility checks passed for every enabled hook; native entity backend ready.");
     if (trace_all_model_loads && guidance_options.diagnostics)
         log_line("[reverse-entity] Model-path tracing enabled; independent render-model pool available.");
-    log_line("[reverse-entity] Reverse guidance v0.3.0-preview.5 ready: enabled=" +
+    log_line("[reverse-entity] Reverse guidance v0.3.0-beta.1 ready: enabled=" +
              std::to_string(guidance_options.enabled) + "; endpoint=" +
              std::to_string(guidance_options.endpoint_outline) + "; front_swing=" +
              std::to_string(guidance_options.front_swing) + "; articulation=" +
@@ -2296,7 +2296,7 @@ bool unsafe_render_independent_prediction_frames(std::uint64_t render_context)
     if (frames.count != 0 && !logged_independent_frame_models.exchange(true, std::memory_order_relaxed))
     {
         log_line("[reverse-entity] Created independent render-only prediction models; active poses=" +
-                 std::to_string(frames.count) + "; guidance v0.3.0-preview.5.");
+                 std::to_string(frames.count) + "; guidance v0.3.0-beta.1.");
     }
     if (frames.count != 0 && !logged_independent_frame_render.exchange(true, std::memory_order_relaxed))
         log_line("[reverse-entity] Tractor-side independent swept-area rendering is active.");
