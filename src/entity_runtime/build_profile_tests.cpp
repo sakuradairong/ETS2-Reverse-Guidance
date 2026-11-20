@@ -1,6 +1,8 @@
 #include "build_profiles.hpp"
 
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 
 #include <algorithm>
@@ -55,13 +57,31 @@ bool file_signature_matches(const std::vector<std::uint8_t> &file,
 
 int main(int argc, char **argv)
 {
-    constexpr std::size_t image_size = 0x01600000;
-    std::vector<std::uint8_t> image(image_size, 0xcc);
+    std::size_t image_size = 0x01600000;
+    const auto grow_image = [&](const auto &specs) {
+        for (const auto &spec : specs)
+            image_size = std::max(image_size,
+                static_cast<std::size_t>(spec.rva) + spec.signature.size());
+    };
     for (const auto &profile : build_profiles)
-        for (const auto &hook : profile.enabled_hooks)
-            std::copy(hook.signature.begin(), hook.signature.end(), image.begin() + hook.rva);
-    for (const auto &helper : verified_161_1_9_model_helpers)
-        std::copy(helper.signature.begin(), helper.signature.end(), image.begin() + helper.rva);
+        grow_image(profile.enabled_hooks);
+    grow_image(verified_161_1_9_model_helpers);
+    grow_image(verified_162_1_0_model_helpers);
+    grow_image(verified_162_1_0_model_methods);
+    grow_image(verified_162_3_3_model_helpers);
+    grow_image(verified_162_3_3_model_methods);
+    std::vector<std::uint8_t> image(image_size, 0xcc);
+    const auto stamp_image = [&](const auto &specs) {
+        for (const auto &spec : specs)
+            std::copy(spec.signature.begin(), spec.signature.end(), image.begin() + spec.rva);
+    };
+    for (const auto &profile : build_profiles)
+        stamp_image(profile.enabled_hooks);
+    stamp_image(verified_161_1_9_model_helpers);
+    stamp_image(verified_162_1_0_model_helpers);
+    stamp_image(verified_162_1_0_model_methods);
+    stamp_image(verified_162_3_3_model_helpers);
+    stamp_image(verified_162_3_3_model_methods);
 
     const auto reader = [&](std::uintptr_t rva, const std::uint8_t *bytes,
                             std::size_t size) {
@@ -83,33 +103,50 @@ int main(int argc, char **argv)
             image[hook.rva] ^= 0xff;
         }
     }
-    assert(model_helpers_161_1_9_match(reader));
-    for (const auto &helper : verified_161_1_9_model_helpers)
-    {
-        image[helper.rva + helper.signature.size() - 1] ^= 0xff;
-        assert(!model_helpers_161_1_9_match(reader));
-        image[helper.rva + helper.signature.size() - 1] ^= 0xff;
-    }
-    // A newer layout must not become an unrestricted signature-only fallback.
-    const auto new_only_reader = [&](std::uintptr_t rva, const std::uint8_t *bytes, std::size_t size) {
-        for (const auto &hook : verified_161_1_9_hooks)
-            if (rva == hook.rva) return reader(rva, bytes, size);
-        return false;
+    const auto assert_helper_mutations_rejected = [&](const auto &specs, auto matcher) {
+        assert(matcher(reader));
+        for (const auto &spec : specs)
+        {
+            image[spec.rva + spec.signature.size() - 1] ^= 0xff;
+            assert(!matcher(reader));
+            image[spec.rva + spec.signature.size() - 1] ^= 0xff;
+        }
     };
-    assert(select_build_profile("UNKNOWN-NEW-BUILD", new_only_reader, &exact, &failed) == nullptr);
+    assert_helper_mutations_rejected(verified_161_1_9_model_helpers,
+                                     [](auto &&r) { return model_helpers_161_1_9_match(r); });
+    assert_helper_mutations_rejected(verified_162_1_0_model_helpers,
+                                     [](auto &&r) { return model_helpers_162_1_0_match(r); });
+    assert_helper_mutations_rejected(verified_162_1_0_model_methods,
+                                     [](auto &&r) { return model_helpers_162_1_0_match(r); });
+    assert_helper_mutations_rejected(verified_162_3_3_model_helpers,
+                                     [](auto &&r) { return model_helpers_162_3_3_match(r); });
+    assert_helper_mutations_rejected(verified_162_3_3_model_methods,
+                                     [](auto &&r) { return model_helpers_162_3_3_match(r); });
+    // Newer layouts must not become an unrestricted signature-only fallback.
+    const auto reject_unknown_hash_for = [&](const auto &hooks) {
+        const auto only_reader = [&](std::uintptr_t rva, const std::uint8_t *bytes, std::size_t size) {
+            for (const auto &hook : hooks)
+                if (rva == hook.rva) return reader(rva, bytes, size);
+            return false;
+        };
+        assert(select_build_profile("UNKNOWN-NEW-BUILD", only_reader, &exact, &failed) == nullptr);
+    };
+    reject_unknown_hash_for(verified_161_1_9_hooks);
+    reject_unknown_hash_for(verified_162_1_0_hooks);
+    reject_unknown_hash_for(verified_162_3_3_hooks);
 
     // A second binary digest is supported by the separately declared
     // signature-compatible profile when all enabled hooks remain verified.
     const auto *compatible_build = select_build_profile(
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
         reader, &exact, &failed);
-    assert(compatible_build == &build_profiles[4]);
+    assert(compatible_build && compatible_build->signature_compatible_fallback);
     assert(!exact);
 
     // Bytes at an old, inactive lifecycle helper are intentionally irrelevant.
     image[0x015288d0] ^= 0xff;
     compatible_build = select_build_profile("SECOND-BUILD", reader, &exact, &failed);
-    assert(compatible_build == &build_profiles[4]);
+    assert(compatible_build && compatible_build->signature_compatible_fallback);
 
     // Any mismatch in an actually enabled hook causes safe rejection.
     const auto &required = verified_160_1_7_hooks[2];
@@ -117,8 +154,8 @@ int main(int argc, char **argv)
     assert(select_build_profile("UNSUPPORTED", reader, &exact, &failed) == nullptr);
     assert(failed == 2);
 
-    std::cout << "build profile tests passed: 1.60, 1.61.1.0, 1.61.1.1, 1.61.1.9 exact profiles + legacy fallback; "
-                 "all hook/helper mutations rejected; unknown-new hash rejected\n";
+    std::cout << "build profile tests passed: 1.60, 1.61.1.0, 1.61.1.1, 1.61.1.9, 1.62.1.0, 1.62.3.3 exact profiles + legacy fallback; "
+                 "all hook/helper/vtable-method mutations rejected; unknown-new hashes rejected\n";
 
     if (argc == 3)
     {
@@ -137,6 +174,10 @@ int main(int argc, char **argv)
         assert(exact_file && exact);
         if (exact_file->game_version == "1.61.1.9")
             assert(model_helpers_161_1_9_match(file_reader));
+        else if (exact_file->game_version == "1.62.1.0")
+            assert(model_helpers_162_1_0_match(file_reader));
+        else if (exact_file->game_version == "1.62.3.3")
+            assert(model_helpers_162_3_3_match(file_reader));
         const auto *dispatch = find_hook(*exact_file, HookId::vehicle_render_dispatch);
         assert(dispatch);
         // The selected entry must dispatch both trailer and tractor virtual
