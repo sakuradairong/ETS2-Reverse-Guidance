@@ -31,11 +31,13 @@ struct PlannerLimits
     double position_tolerance = 0.60, heading_tolerance = 4.0 * pi / 180.0;
     double maximum_distance = 40.0, primitive_distance = 0.75;
     std::size_t maximum_expansions = 18000, maximum_nodes = 80000;
-    // Allow one initial forward pull-up leg before switching to reverse when
-    // pure reverse cannot reach the goal or requires excessive maneuvering.
-    bool allow_pullup = true;
+    // Bidirectional Hybrid A* pull-up and gear-change limits.
+    bool allow_forward_pullup = true;
+    std::uint8_t max_gear_changes = 2;
+    double gear_change_penalty = 3.2;
+    double forward_step_penalty = 1.35;
+    double forward_primitive_distance = 1.0;
     double maximum_pullup_distance = 12.0;
-    double gear_switch_penalty = 3.5;
 };
 enum class PlanStatus { idle, searching, ready, invalid, outside_envelope, exhausted, budget };
 struct ReverseSample
@@ -109,7 +111,7 @@ inline Pose from_ground_frame(Pose point, const Pose &origin)
             normalize_angle(point.heading + origin.heading)};
 }
 
-// Incremental weighted Hybrid A* with optional single initial forward pull-up.
+// Incremental weighted bidirectional Hybrid A* with analytic terminal shot.
 // Exhaustion means no path in this discretized envelope, never a proof of
 // physical infeasibility. No work occurs in draw hooks.
 class ReversePlanner
@@ -131,7 +133,7 @@ class ReversePlanner
     struct Node
     {
         ReverseState state;
-        double distance, pullup_distance, cost, request;
+        double distance, pullup_distance, step_distance, cost, request;
         std::size_t parent;
         bool forward;
         std::uint8_t switches;
@@ -147,33 +149,112 @@ class ReversePlanner
     std::vector<Open> open_;
     std::unordered_map<Key, double, Hash> best_;
     std::vector<ReverseSample> route_;
+    std::vector<std::size_t> gear_change_indices_;
     Pose origin_;
     ReverseRig rig_;
     ReverseGoal goal_;
     PlannerLimits limits_;
     PlanStatus status_ = PlanStatus::idle;
     std::size_t expansions_ = 0;
-    std::size_t switch_index_ = 0;
     bool has_pullup_ = false;
+    bool used_terminal_shot_ = false;
+
     Key key(const ReverseState &s, bool forward, std::uint8_t switches) const
     {
         const auto angle_bin = [](double angle) {
             int value = static_cast<int>(std::lround(normalize_angle(angle) / (pi / 36.0)));
             return value == 36 ? -36 : value;
         };
-        const int phase = (forward ? 1 : 0) + 2 * static_cast<int>(switches);
+        const int dir_phase = (forward ? 1 : 0) + 2 * static_cast<int>(switches);
         return {{{static_cast<int>(std::lround(s.tractor.x / 0.4)),
                   static_cast<int>(std::lround(s.tractor.z / 0.4)), angle_bin(s.tractor.heading),
                   angle_bin(s.trailer_heading), static_cast<int>(std::lround(s.steering / 0.10)),
-                  phase}}};
+                  dir_phase}}};
     }
+
+    // Target-rear-frame heuristic penalizing lateral misalignment and overshoot.
     double heuristic(const ReverseState &s) const
     {
         const auto rear = reverse_rear(s, rig_);
-        return std::hypot(rear.x - goal_.rear.x, rear.z - goal_.rear.z) +
-            5.0 * std::abs(normalize_angle(rear.heading - goal_.rear.heading));
+        const auto rel = to_ground_frame(rear, goal_.rear);
+        const double euclid = std::hypot(rel.x, rel.z);
+        const double lateral_pen = 0.65 * std::abs(rel.x);
+        const double overshoot_pen = rel.z > 0.5 ? 0.80 * (rel.z - 0.5) : 0.0;
+        return euclid + lateral_pen + overshoot_pen + 5.0 * std::abs(rel.heading);
     }
-    void finish(std::size_t index)
+
+    // Closed-loop 5 cm analytic terminal shot when within 8 m of the goal bay.
+    bool try_terminal_shot(const Node &node, std::vector<ReverseSample> &tail) const
+    {
+        tail.clear();
+        const auto rear = reverse_rear(node.state, rig_);
+        const auto rel = to_ground_frame(rear, goal_.rear);
+        const double dist = std::hypot(rel.x, rel.z);
+        if (dist > 8.0 || rel.z > 0.60 || std::abs(rel.heading) > 55.0 * pi / 180.0 ||
+            articulation(node.state) > 45.0 * pi / 180.0)
+            return false;
+
+        const double remaining_budget = limits_.maximum_distance - node.distance;
+        const double max_shot = std::min(remaining_budget, dist + 4.0);
+        if (max_shot < 0.05) return false;
+
+        ReverseState s = node.state;
+        double travelled = 0.0;
+        constexpr double ds = 0.05;
+        const int max_steps = static_cast<int>(std::floor(max_shot / ds));
+        tail.reserve(static_cast<std::size_t>(max_steps) + 1);
+        std::size_t best_reached_len = 0;
+        double best_reached_dist = std::numeric_limits<double>::infinity();
+        for (int step = 0; step < max_steps; ++step)
+        {
+            const auto err = to_ground_frame(reverse_rear(s, rig_), goal_.rear);
+            if (goal_reached(s, goal_, rig_, limits_))
+            {
+                const double d = std::hypot(err.x, err.z);
+                if (d < best_reached_dist)
+                {
+                    best_reached_dist = d;
+                    best_reached_len = tail.size();
+                }
+                else
+                {
+                    tail.resize(best_reached_len);
+                    return true;
+                }
+                if (err.z >= -0.05) return true;
+            }
+            else if (best_reached_len > 0)
+            {
+                tail.resize(best_reached_len);
+                return true;
+            }
+            if (err.z > limits_.position_tolerance + 0.35) return false;
+            const double gamma = normalize_angle(s.trailer_heading - s.tractor.heading);
+            const double desired_trailer = -std::atan(0.24 * std::clamp(err.x, -2.5, 2.5));
+            const double trailer_err = normalize_angle(err.heading - desired_trailer);
+            const double gamma_des = std::clamp(-1.55 * trailer_err, -0.45, 0.45);
+            const double denom = std::max(1.0, rig_.trailer_length + rig_.hitch_rear * std::cos(gamma));
+            const double k_cancel = -std::sin(gamma) / denom;
+            const double k_track = -0.45 * normalize_angle(gamma - gamma_des);
+            const double cmd = std::clamp(std::atan(rig_.wheelbase * (k_cancel + k_track)),
+                                          -limits_.search_steering, limits_.search_steering);
+            if (!motion_primitive(s, rig_, cmd, ds, false, limits_))
+            {
+                if (best_reached_len > 0) { tail.resize(best_reached_len); return true; }
+                return false;
+            }
+            travelled += ds;
+            tail.push_back({s, node.distance + travelled, false});
+        }
+        if (best_reached_len > 0)
+        {
+            tail.resize(best_reached_len);
+            return true;
+        }
+        return goal_reached(s, goal_, rig_, limits_);
+    }
+
+    void finish(std::size_t index, const std::vector<ReverseSample> *terminal_tail = nullptr)
     {
         std::vector<std::size_t> chain;
         while (index != 0) { chain.push_back(index); index = nodes_[index].parent; }
@@ -183,20 +264,31 @@ class ReversePlanner
         const bool starts_forward = !chain.empty() && nodes_[chain.front()].forward;
         route_.push_back({state, distance, starts_forward});
         has_pullup_ = starts_forward;
-        switch_index_ = 0;
+        bool prev_forward = starts_forward;
         for (const auto child : chain)
         {
             const bool seg_forward = nodes_[child].forward;
-            if (has_pullup_ && switch_index_ == 0 && !seg_forward)
-                switch_index_ = route_.size() - 1;
-            const int pieces = static_cast<int>(std::ceil(limits_.primitive_distance / 0.05));
-            const double ds = limits_.primitive_distance / pieces;
+            if (seg_forward) has_pullup_ = true;
+            if (seg_forward != prev_forward)
+                gear_change_indices_.push_back(route_.size() - 1);
+            prev_forward = seg_forward;
+            const double seg_dist = nodes_[child].step_distance;
+            const int pieces = std::max(1, static_cast<int>(std::ceil(seg_dist / 0.05)));
+            const double ds = seg_dist / pieces;
             for (int part = 0; part < pieces; ++part)
             {
                 motion_primitive(state, rig_, nodes_[child].request, ds, seg_forward, limits_);
                 distance += ds;
                 route_.push_back({state, distance, seg_forward});
             }
+        }
+        if (terminal_tail && !terminal_tail->empty())
+        {
+            if (prev_forward)
+                gear_change_indices_.push_back(route_.size() - 1);
+            for (const auto &sample : *terminal_tail)
+                route_.push_back(sample);
+            used_terminal_shot_ = true;
         }
         for (auto &sample : route_)
         {
@@ -208,13 +300,20 @@ class ReversePlanner
 public:
     PlanStatus status() const { return status_; }
     const auto &route() const { return route_; }
+    const auto &gear_change_indices() const { return gear_change_indices_; }
     std::size_t expansions() const { return expansions_; }
     bool has_pullup() const { return has_pullup_; }
-    std::size_t switch_index() const { return switch_index_; }
+    bool used_terminal_shot() const { return used_terminal_shot_; }
+    std::size_t switch_index() const
+    {
+        return gear_change_indices_.empty() ? 0 : gear_change_indices_.front();
+    }
     void clear()
     {
         nodes_.clear(); open_.clear(); best_.clear(); route_.clear();
-        expansions_ = 0; switch_index_ = 0; has_pullup_ = false; status_ = PlanStatus::idle;
+        gear_change_indices_.clear();
+        expansions_ = 0; has_pullup_ = false; used_terminal_shot_ = false;
+        status_ = PlanStatus::idle;
     }
     void start(ReverseState state, ReverseGoal goal, ReverseRig rig, PlannerLimits limits = {})
     {
@@ -223,7 +322,8 @@ public:
             rig.overhang, rig.width, state.trailer_heading, state.steering, limits.maximum_steering,
             limits.search_steering, limits.steering_per_metre, limits.maximum_articulation, limits.arrival_articulation,
             limits.position_tolerance, limits.heading_tolerance, limits.maximum_distance, limits.primitive_distance,
-            limits.maximum_pullup_distance, limits.gear_switch_penalty};
+            limits.forward_primitive_distance, limits.forward_step_penalty,
+            limits.maximum_pullup_distance, limits.gear_change_penalty};
         if (!finite_pose(state.tractor) || !finite_pose(goal.rear) ||
             !std::all_of(values.begin(), values.end(), [](double v) { return std::isfinite(v); }) ||
             rig.wheelbase < 2.4 || rig.wheelbase > 6.8 || rig.trailer_length < 2.0 || rig.trailer_length > 16.0 ||
@@ -238,8 +338,10 @@ public:
             limits.position_tolerance <= 0 || limits.heading_tolerance <= 0 || limits.heading_tolerance > pi ||
             limits.maximum_distance <= 0 || limits.maximum_distance > 60 ||
             limits.primitive_distance < 0.1 || limits.primitive_distance > 1.0 ||
+            limits.forward_primitive_distance < 0.1 || limits.forward_primitive_distance > 2.0 ||
+            limits.forward_step_penalty < 1.0 ||
             limits.maximum_pullup_distance < 0 || limits.maximum_pullup_distance > 25.0 ||
-            limits.gear_switch_penalty < 0 ||
+            limits.gear_change_penalty < 0 || limits.max_gear_changes > 4 ||
             limits.maximum_expansions > 100000 || limits.maximum_nodes > 200000 ||
             articulation(state) > limits.maximum_articulation)
         { status_ = PlanStatus::invalid; return; }
@@ -254,7 +356,7 @@ public:
         nodes_.reserve(reserve_count);
         best_.reserve(reserve_count);
         open_.reserve(reserve_count);
-        nodes_.push_back({state, 0.0, 0.0, 0.0, state.steering, 0, false, 0});
+        nodes_.push_back({state, 0.0, 0.0, 0.0, 0.0, state.steering, 0, false, 0});
         best_.emplace(key(state, false, 0), 0.0);
         open_.push_back({heuristic(state), 0});
         std::push_heap(open_.begin(), open_.end());
@@ -264,6 +366,7 @@ public:
     void advance(std::size_t work = 48, std::chrono::microseconds slice = std::chrono::microseconds(1500))
     {
         const auto deadline = std::chrono::steady_clock::now() + slice;
+        std::vector<ReverseSample> shot_tail;
         for (std::size_t tick = 0; status_ == PlanStatus::searching && tick < work; ++tick)
         {
             if (std::chrono::steady_clock::now() >= deadline) break;
@@ -278,16 +381,22 @@ public:
             ++expansions_;
             if ((!node.forward || item.index == 0) && goal_reached(node.state, goal_, rig_, limits_))
             { finish(item.index); break; }
-            if (node.distance + limits_.primitive_distance > limits_.maximum_distance) continue;
+            // Try closed-loop analytic terminal shot when close to the goal bay.
+            const bool can_shoot_reverse = !node.forward ||
+                (node.switches + 1 <= limits_.max_gear_changes);
+            if (can_shoot_reverse && try_terminal_shot(node, shot_tail))
+            { finish(item.index, &shot_tail); break; }
 
             const auto try_expand = [&](double requested, bool next_forward,
-                                        std::uint8_t next_switches, double extra_cost) -> bool {
+                                        double step_dist, std::uint8_t next_switches,
+                                        double extra_cost) -> bool {
+                if (node.distance + step_dist > limits_.maximum_distance) return true;
                 auto next = node.state;
-                if (!motion_primitive(next, rig_, requested, limits_.primitive_distance,
+                if (!motion_primitive(next, rig_, requested, step_dist,
                                       next_forward, limits_))
                     return true;
-                const double step_weight = next_forward ? 1.15 : 1.0;
-                const double cost = node.cost + step_weight * limits_.primitive_distance + extra_cost +
+                const double step_weight = next_forward ? limits_.forward_step_penalty : 1.0;
+                const double cost = node.cost + step_weight * step_dist + extra_cost +
                     0.15 * std::abs(next.steering) + 0.4 * std::abs(next.steering - node.state.steering);
                 const auto k = key(next, next_forward, next_switches);
                 const auto found = best_.find(k);
@@ -295,34 +404,46 @@ public:
                 if (nodes_.size() >= limits_.maximum_nodes) { status_ = PlanStatus::budget; return false; }
                 best_[k] = cost;
                 const auto index = nodes_.size();
-                const double next_pullup = node.pullup_distance +
-                    (next_forward ? limits_.primitive_distance : 0.0);
-                nodes_.push_back({next, node.distance + limits_.primitive_distance, next_pullup,
+                const double next_pullup = node.pullup_distance + (next_forward ? step_dist : 0.0);
+                nodes_.push_back({next, node.distance + step_dist, next_pullup, step_dist,
                                   cost, requested, item.index, next_forward, next_switches});
-                const double h_bias = next_forward ? limits_.gear_switch_penalty : 0.0;
+                const double h_bias = next_forward ? limits_.gear_change_penalty : 0.0;
                 open_.push_back({cost + 2.5 * heuristic(next) + h_bias, index});
                 std::push_heap(open_.begin(), open_.end());
                 return true;
             };
 
-            // Reverse transitions (either continuing reverse or switching from pull-up to reverse).
+            // 5 reverse actions (continuing reverse or shifting from forward to reverse).
             const bool switching_to_reverse = node.forward;
-            const std::uint8_t rev_switches = switching_to_reverse ? 1 : node.switches;
-            const double switch_cost = switching_to_reverse ? limits_.gear_switch_penalty : 0.0;
-            bool ok = true;
-            for (int steer = -2; steer <= 2 && ok; ++steer)
-                ok = try_expand(limits_.search_steering * steer / 2.0, false, rev_switches, switch_cost);
-            if (!ok) break;
-
-            // Optional single initial forward pull-up leg to realign before reversing.
-            if (limits_.allow_pullup &&
-                (item.index == 0 || (node.forward && node.switches == 0)) &&
-                node.pullup_distance + limits_.primitive_distance <= limits_.maximum_pullup_distance)
+            const std::uint8_t rev_switches = switching_to_reverse
+                ? static_cast<std::uint8_t>(node.switches + 1) : node.switches;
+            if (!switching_to_reverse || rev_switches <= limits_.max_gear_changes)
             {
-                for (int steer : {-2, 0, 2})
+                const double switch_cost = switching_to_reverse ? limits_.gear_change_penalty : 0.0;
+                bool ok = true;
+                for (int steer = -2; steer <= 2 && ok; ++steer)
+                    ok = try_expand(limits_.search_steering * steer / 2.0, false,
+                                    limits_.primitive_distance, rev_switches, switch_cost);
+                if (!ok) break;
+            }
+
+            // 3 forward pull-up actions (full-left / straight / full-right) when permitted.
+            if (limits_.allow_forward_pullup &&
+                node.pullup_distance + limits_.forward_primitive_distance <= limits_.maximum_pullup_distance)
+            {
+                const bool switching_to_forward = !node.forward && item.index != 0;
+                const std::uint8_t fwd_switches = switching_to_forward
+                    ? static_cast<std::uint8_t>(node.switches + 1) : node.switches;
+                // Reserve one switch to shift back to reverse unless already at limit.
+                if (fwd_switches < limits_.max_gear_changes)
                 {
-                    if (!try_expand(limits_.search_steering * steer / 2.0, true, 0, 0.0))
-                        break;
+                    const double switch_cost = switching_to_forward ? limits_.gear_change_penalty : 0.0;
+                    for (int steer : {-2, 0, 2})
+                    {
+                        if (!try_expand(limits_.search_steering * steer / 2.0, true,
+                                        limits_.forward_primitive_distance, fwd_switches, switch_cost))
+                            break;
+                    }
                 }
             }
         }

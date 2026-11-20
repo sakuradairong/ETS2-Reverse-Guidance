@@ -3184,7 +3184,7 @@ void update_prediction_frame_targets()
         std::isfinite(target_state.steering) &&
         std::abs(target_state.steering) <= reverse_assist::PlannerLimits{}.maximum_steering;
     target.update(target_state, rig, telemetry.speed_valid ? telemetry.speed :
-        std::numeric_limits<double>::quiet_NaN(), telemetry.gear < 0, target_supported, now, target_input);
+        std::numeric_limits<double>::quiet_NaN(), telemetry.gear, target_supported, now, target_input);
     if (target_input.toggle && target.cue() == reverse_assist::TargetCue::data)
     {
         std::ostringstream message;

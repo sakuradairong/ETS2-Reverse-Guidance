@@ -345,7 +345,7 @@ int main(int argc, char **argv)
         const ReverseGoal tight_goal{reverse_rear(pullup_fixture, rig)};
 
         PlannerLimits no_pullup = limits;
-        no_pullup.allow_pullup = false;
+        no_pullup.allow_forward_pullup = false;
         ReversePlanner pure_rev;
         pure_rev.start(folded_start, tight_goal, rig, no_pullup);
         solve(pure_rev);
@@ -354,8 +354,8 @@ int main(int argc, char **argv)
         bidir.start(folded_start, tight_goal, rig, limits);
         solve(bidir);
         check(bidir.status() == PlanStatus::ready, "1-pull-up planner solves tightly folded bay");
-        check(bidir.has_pullup() && bidir.switch_index() > 0 &&
-              bidir.switch_index() + 1 < bidir.route().size(),
+        check(bidir.has_pullup() && !bidir.gear_change_indices().empty() &&
+              bidir.switch_index() > 0 && bidir.switch_index() + 1 < bidir.route().size(),
               "solution uses an initial forward pull-up leg before reversing");
         // Verify full bidirectional kinematic replay of every 5 cm sample.
         ReverseState sim = folded_start;
@@ -375,9 +375,10 @@ int main(int argc, char **argv)
         }
         check(goal_reached(sim, tight_goal, rig, limits), "bidirectional replay reaches goal");
 
-        // Walk ReverseTarget state machine through pull-up -> switch STOP -> reverse -> arrived.
+        // Walk ReverseTarget state machine using the real int gear overload
+        // through pull-up (<=8 km/h forward) -> neutral/STOP at switch -> reverse -> arrived.
         ReverseTarget pullup_target;
-        pullup_target.update(folded_start, rig, 0, true, true, 13000, toggle);
+        pullup_target.update(folded_start, rig, 0, -1, true, 13000, toggle);
         const auto cur_goal = pullup_target.goal().rear;
         TargetInput shift_goal{};
         const auto delta = to_ground_frame(tight_goal.rear, folded_start.tractor);
@@ -386,52 +387,77 @@ int main(int argc, char **argv)
         shift_goal.rearward = delta.z - cur_local.z;
         shift_goal.rotation = normalize_angle(tight_goal.rear.heading - cur_goal.heading);
         shift_goal.confirm = true;
-        pullup_target.update(folded_start, rig, 0, true, true, 13100, shift_goal);
+        pullup_target.update(folded_start, rig, 0, -1, true, 13100, shift_goal);
         for (int i = 0; i < 1500 && pullup_target.cue() == TargetCue::wait; ++i)
-            pullup_target.update(folded_start, rig, 0, true, true, 13200 + i * 16, {});
+            pullup_target.update(folded_start, rig, 0, -1, true, 13200 + i * 16, {});
         check(pullup_target.planner().status() == PlanStatus::ready &&
               pullup_target.planner().has_pullup(),
-              "ReverseTarget finds 1-pull-up route");
+              "ReverseTarget finds bidirectional pull-up route");
         // Still in reverse gear at start of pull-up leg -> prompts MOVE (pull forward).
-        pullup_target.update(folded_start, rig, 0, true, true, 40000, {});
+        pullup_target.update(folded_start, rig, 0, -1, true, 40000, {});
         check(pullup_target.cue() == TargetCue::move &&
               pullup_target.planner().status() == PlanStatus::ready,
               "pull-up leg prompts driver to pull forward while still in reverse gear");
-        // Verify visual distinction: pull-up leg blue, switch marker green, reverse leg cyan.
+        // Verify visual distinction: pull-up leg blue, switch marker preview, reverse leg cyan.
         const auto pullup_draw = target_geometry(pullup_target, rig, folded_start.tractor);
         check(pullup_draw.count <= maximum_guidance_segments - 96 && !pullup_draw.truncated,
-              "1-pull-up target display respects 96-segment reserve");
-        bool has_blue_route = false, has_cyan_route = false, has_green_switch = false;
+              "bidirectional target display respects 96-segment reserve");
+        bool has_blue_route = false, has_cyan_route = false, has_preview_switch = false;
         for (std::size_t i = 0; i < pullup_draw.count; ++i)
         {
             if (pullup_draw.segments[i].layer != GuideLayer::target_route) continue;
             if (pullup_draw.segments[i].style == GuideStyle::tractor) has_blue_route = true;
             if (pullup_draw.segments[i].style == GuideStyle::target) has_cyan_route = true;
-            if (pullup_draw.segments[i].style == GuideStyle::straightening) has_green_switch = true;
+            if (pullup_draw.segments[i].style == GuideStyle::preview) has_preview_switch = true;
         }
-        check(has_blue_route && has_cyan_route && has_green_switch,
-              "1-pull-up route renders blue pull-up leg, green switch marker and cyan reverse leg");
+        check(has_blue_route && has_cyan_route && has_preview_switch,
+              "bidirectional route renders blue pull-up leg, preview switch cross and cyan reverse leg");
 
         const auto &pr = pullup_target.planner().route();
         const auto sw = pullup_target.planner().switch_index();
-        // Shift to forward gear and follow pull-up leg before the 0.40 m switch-stop zone.
+        // Shift to forward gear (+1) and follow pull-up leg at 6.5 km/h (1.8 m/s <= 8 km/h limit).
         const std::size_t mid_pullup = sw > 12 ? sw - 12 : sw / 2;
         for (std::size_t i = 2; i <= mid_pullup; i += 4)
-            pullup_target.update(pr[i].state, rig, 0.5, false, true, 40100 + i * 16, {});
+            pullup_target.update(pr[i].state, rig, 1.8, 1, true, 40100 + i * 16, {});
         check(pullup_target.planner().status() == PlanStatus::ready &&
-              pullup_target.cue() != TargetCue::stop && pullup_target.cue() != TargetCue::move,
-              "pull-up forward driving tracks smoothly with steering cues");
-        pullup_target.update(pr[sw].state, rig, 0.3, false, true, 42000, {});
-        check(pullup_target.cue() == TargetCue::stop, "reaching switch point requests stop");
-        // Stop and shift into reverse gear -> smoothly enters reverse leg.
-        pullup_target.update(pr[sw].state, rig, 0.0, true, true, 42100, {});
+              pullup_target.cue() != TargetCue::stop && pullup_target.cue() != TargetCue::move &&
+              pullup_target.cue() != TargetCue::slow,
+              "pull-up forward driving tracks smoothly up to 8 km/h with int gear overload");
+        pullup_target.update(pr[sw].state, rig, 0.3, 1, true, 42000, {});
+        check(pullup_target.cue() == TargetCue::stop &&
+              pullup_target.planner().status() == PlanStatus::ready,
+              "reaching switch point requests stop without clearing route");
+        // Shifting through neutral (gear == 0) at switch point keeps route intact.
+        pullup_target.update(pr[sw].state, rig, 0.0, 0, true, 42050, {});
+        check(pullup_target.cue() == TargetCue::stop &&
+              pullup_target.planner().status() == PlanStatus::ready,
+              "neutral pause at switch point preserves planned route");
+        // Shift into reverse gear (-1) while stopped -> smoothly enters reverse leg.
+        pullup_target.update(pr[sw].state, rig, 0.0, -1, true, 42100, {});
         check(pullup_target.cursor() > sw && pullup_target.planner().status() == PlanStatus::ready,
               "shifting to reverse at switch point advances into reverse leg");
         for (std::size_t i = sw + 2; i + 1 < pr.size(); i += 5)
-            pullup_target.update(pr[i].state, rig, -0.4, true, true, 42200 + i * 16, {});
-        pullup_target.update(pr.back().state, rig, 0.0, true, true, 46000, {});
+            pullup_target.update(pr[i].state, rig, -0.4, -1, true, 42200 + i * 16, {});
+        pullup_target.update(pr.back().state, rig, 0.0, -1, true, 46000, {});
         check(pullup_target.cue() == TargetCue::arrived,
-              "completing 1-pull-up route reaches arrived state");
+              "completing bidirectional route reaches arrived state");
+    }
+
+    // Analytic Terminal Shot: within 8 m with small lateral/yaw offset, planner
+    // directly stitches a smooth 5 cm closed-loop terminal segment on expansion 1.
+    {
+        ReverseState shot_goal_st = start;
+        check(reverse_primitive(shot_goal_st, rig, 0.0, 6.0, limits), "shot fixture straight");
+        ReverseGoal shot_goal{reverse_rear(shot_goal_st, rig)};
+        shot_goal.rear.x += std::cos(start.tractor.heading) * 0.45;
+        shot_goal.rear.z -= std::sin(start.tractor.heading) * 0.45;
+        ReversePlanner shot_planner;
+        shot_planner.start(start, shot_goal, rig, limits);
+        solve(shot_planner);
+        check(shot_planner.status() == PlanStatus::ready &&
+              shot_planner.used_terminal_shot() && shot_planner.expansions() <= 10,
+              "analytic terminal shot solves <8m bay in minimal expansions");
+        replay(shot_planner, start, shot_goal, rig);
     }
 
     // Closed-loop feedback-linearized steering converges from mirrored +/-0.45 m

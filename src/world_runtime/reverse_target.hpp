@@ -70,6 +70,10 @@ inline double compute_closed_loop_steering(const ReverseState &state,
                                            const PlannerLimits &limits = {})
 {
     double feedback = 0.0;
+    const auto apply_deadband = [](double value, double band) {
+        if (std::abs(value) <= band) return 0.0;
+        return value > 0.0 ? value - band : value + band;
+    };
     if (!nearest_sample.forward)
     {
         const auto ref_rear = reverse_rear(nearest_sample.state, rig);
@@ -78,25 +82,26 @@ inline double compute_closed_loop_steering(const ReverseState &state,
         const double gamma = normalize_angle(state.trailer_heading - state.tractor.heading);
         const double gamma_ref = normalize_angle(
             nearest_sample.state.trailer_heading - nearest_sample.state.tractor.heading);
-        // Feedback-linearized cascade for reversing a semi-trailer:
-        // 1) rear-bumper lateral error sets desired trailer heading (natural phase lead);
+        // Feedback-linearized cascade with small deadband for steady straight cues:
+        // 1) rear-bumper lateral error sets desired trailer heading;
         // 2) trailer heading error sets desired articulation offset;
         // 3) cancel the open-loop unstable +sin(gamma)/(L2 + h*cos(gamma)) pole while
         //    tracking gamma_des so the driver is prompted to catch the swing in time.
-        const double desired_trailer_offset = -std::atan(0.22 * std::clamp(err.x, -2.0, 2.0));
+        const double lat_err = apply_deadband(std::clamp(err.x, -2.0, 2.0), 0.03);
+        const double desired_trailer_offset = -std::atan(0.22 * lat_err);
         const double trailer_err = normalize_angle(err.heading - desired_trailer_offset);
         const double gamma_des = std::clamp(gamma_ref - 1.50 * trailer_err, -0.45, 0.45);
         const double denom = std::max(1.0, rig.trailer_length + rig.hitch_rear * std::cos(gamma));
         const double k_cancel = -(std::sin(gamma) - std::sin(gamma_ref)) / denom;
         const double k_track = -0.35 * normalize_angle(gamma - gamma_des);
-        feedback = std::atan(rig.wheelbase * (k_cancel + k_track));
+        feedback = apply_deadband(std::atan(rig.wheelbase * (k_cancel + k_track)), 0.4 * pi / 180.0);
     }
     else
     {
         const auto tr_err = to_ground_frame(state.tractor, nearest_sample.state.tractor);
-        feedback = std::clamp(
-            0.75 * std::atan(0.60 * std::clamp(tr_err.x, -1.5, 1.5)) - 0.85 * tr_err.heading,
-            -0.32, 0.32);
+        const double lat_err = apply_deadband(std::clamp(tr_err.x, -1.5, 1.5), 0.05);
+        const double yaw_err = apply_deadband(tr_err.heading, 1.0 * pi / 180.0);
+        feedback = std::clamp(0.75 * std::atan(0.60 * lat_err) - 0.85 * yaw_err, -0.32, 0.32);
     }
     return std::clamp(lookahead_sample.state.steering + feedback,
                       -limits.search_steering, limits.search_steering);
@@ -129,13 +134,22 @@ public:
         planner_.clear(); cursor_ = 0; last_replan_ = 0; cue_ = TargetCue::off;
         desired_steering_ = 0.0;
     }
+    // Backward-compatible bool overload maps reverse_gear into signed gear.
     void update(const ReverseState &state, const ReverseRig &rig, double speed,
                 bool reverse_gear, bool supported, std::uint64_t now, const TargetInput &input)
     {
+        update(state, rig, speed, reverse_gear ? -1 : 1, supported, now, input);
+    }
+    // Primary overload accepting real signed gear (<0 reverse, 0 neutral, >0 forward).
+    void update(const ReverseState &state, const ReverseRig &rig, double speed,
+                int gear, bool supported, std::uint64_t now, const TargetInput &input)
+    {
         if (input.clear) { reset(); return; }
+        const bool reverse_gear = gear < 0;
+        const bool forward_gear = gear > 0;
         const bool stopped = std::isfinite(speed) && std::abs(speed) < 0.05;
         PlannerLimits limits{};
-        limits.allow_pullup = allow_pullup_;
+        limits.allow_forward_pullup = allow_pullup_;
         const bool state_valid = finite_pose(state.tractor) && std::isfinite(state.trailer_heading) &&
             std::abs(state.trailer_heading) < 100*pi && std::isfinite(state.steering) &&
             std::abs(state.steering) <= limits.maximum_steering &&
@@ -204,12 +218,54 @@ public:
             cue_ = std::abs(speed) * 3.6 > 5.0 ? TargetCue::slow : TargetCue::stop;
             return;
         }
-        if (std::abs(speed) * 3.6 > 5.0)
+
+        const bool plan_ready = planner_.status() == PlanStatus::ready &&
+            cursor_ < planner_.route().size();
+        const bool on_pullup = plan_ready && planner_.route()[cursor_].forward;
+        const double speed_kmh = std::abs(speed) * 3.6;
+        // Forward pull-up legs allow up to 8 km/h; reverse legs stay capped at 5 km/h.
+        const double max_leg_speed_kmh = on_pullup ? 8.0 : 5.0;
+        if (speed_kmh > max_leg_speed_kmh)
         { planner_.clear(); requested_ = true; cue_ = TargetCue::slow; return; }
 
-        const bool ready_pullup = planner_.status() == PlanStatus::ready &&
+        // Locate the next gear-change point on or ahead of cursor_.
+        std::size_t next_switch = 0;
+        if (plan_ready)
+        {
+            for (const auto idx : planner_.gear_change_indices())
+            {
+                if (idx >= cursor_) { next_switch = idx; break; }
+            }
+        }
+        // At a planned gear-change point, prompt STOP without clearing the route
+        // while the driver shifts through neutral into the next leg's gear.
+        if (plan_ready && next_switch > 0 && next_switch < planner_.route().size())
+        {
+            const auto &switch_pose = planner_.route()[next_switch].state;
+            const bool at_switch =
+                std::hypot(switch_pose.tractor.x - state.tractor.x,
+                           switch_pose.tractor.z - state.tractor.z) <= 0.40 &&
+                std::abs(normalize_angle(switch_pose.tractor.heading - state.tractor.heading)) <= 8.0 * pi / 180.0;
+            if (at_switch && next_switch + 1 < planner_.route().size())
+            {
+                const bool next_forward = planner_.route()[next_switch + 1].forward;
+                const bool next_gear_ok = next_forward ? forward_gear : reverse_gear;
+                if (stopped && next_gear_ok)
+                {
+                    cursor_ = next_switch + 1;
+                }
+                else
+                {
+                    cursor_ = next_switch;
+                    cue_ = TargetCue::stop;
+                    return;
+                }
+            }
+        }
+
+        const bool active_pullup = planner_.status() == PlanStatus::ready &&
             cursor_ < planner_.route().size() && planner_.route()[cursor_].forward;
-        if (!ready_pullup && (!reverse_gear || speed > 0.10))
+        if (!active_pullup && (!reverse_gear || speed > 0.10))
         { planner_.clear(); requested_ = true; cue_ = TargetCue::stop; return; }
 
         if (planner_.status() == PlanStatus::searching)
@@ -247,43 +303,26 @@ public:
         default: cue_ = TargetCue::edit; return;
         }
         const auto &route = planner_.route();
-        const std::size_t switch_idx = planner_.has_pullup() ? planner_.switch_index() : 0;
-        const bool on_pullup = cursor_ < route.size() && route[cursor_].forward;
-        if (on_pullup)
+        // Refresh next gear-change boundary after potential switch advance.
+        next_switch = 0;
+        for (const auto idx : planner_.gear_change_indices())
         {
-            const std::size_t leg_end = switch_idx > 0 && switch_idx < route.size()
-                ? switch_idx : route.size() - 1;
-            const auto &switch_pose = route[leg_end].state;
-            const bool at_switch =
-                std::hypot(switch_pose.tractor.x - state.tractor.x,
-                           switch_pose.tractor.z - state.tractor.z) <= 0.40 &&
-                std::abs(normalize_angle(switch_pose.tractor.heading - state.tractor.heading)) <= 8.0 * pi / 180.0;
-            if (at_switch && stopped && reverse_gear && leg_end + 1 < route.size())
+            if (idx >= cursor_) { next_switch = idx; break; }
+        }
+        const bool tracking_pullup = cursor_ < route.size() && route[cursor_].forward;
+        if (tracking_pullup)
+        {
+            if (speed < -0.10)
+            { planner_.clear(); requested_ = true; cue_ = TargetCue::stop; return; }
+            if (!forward_gear)
             {
-                cursor_ = leg_end + 1;
-            }
-            else if (at_switch)
-            {
-                cursor_ = leg_end;
-                cue_ = TargetCue::stop;
-                return;
-            }
-            else if (reverse_gear)
-            {
-                if (speed < -0.10)
-                { planner_.clear(); requested_ = true; cue_ = TargetCue::stop; return; }
-                // Ask the driver to shift out of reverse and pull forward along the blue leg.
+                // Prompt driver to shift into forward gear and pull up along the blue leg.
                 cue_ = TargetCue::move;
                 return;
             }
-            else if (speed < -0.10)
-            {
-                planner_.clear(); requested_ = true; cue_ = TargetCue::stop; return;
-            }
         }
-        const bool tracking_pullup = cursor_ < route.size() && route[cursor_].forward;
-        const std::size_t segment_limit = tracking_pullup && switch_idx > 0 && switch_idx < route.size()
-            ? switch_idx + 1 : route.size();
+        const std::size_t segment_limit = next_switch > 0 && next_switch < route.size()
+            ? next_switch + 1 : route.size();
         double closest_position = std::numeric_limits<double>::infinity();
         double closest_tractor_heading = std::numeric_limits<double>::infinity();
         double closest_trailer_heading = std::numeric_limits<double>::infinity();
@@ -309,7 +348,7 @@ public:
         cursor_ = nearest;
         constexpr double tractor_heading_allowance = 26.0 * pi / 180.0;
         constexpr double trailer_heading_allowance = 18.0 * pi / 180.0;
-        if (tracking_pullup && switch_idx > 0 && cursor_ >= switch_idx)
+        if (next_switch > 0 && cursor_ >= next_switch)
         {
             cue_ = TargetCue::stop;
             return;
@@ -415,10 +454,10 @@ inline GuidanceGeometry target_geometry(const ReverseTarget &target, const Rever
         const auto begin = target.cursor();
         // Leave at least 96 segments to the actual-steering forecast.
         constexpr std::size_t target_budget = maximum_guidance_segments - 96;
-        const bool show_switch_marker = target.planner().has_pullup() &&
-            target.planner().switch_index() >= begin &&
-            target.planner().switch_index() < route.size();
-        const std::size_t marker_reserve = show_switch_marker ? 2 : 0;
+        std::size_t switch_markers = 0;
+        for (const auto sw_idx : target.planner().gear_change_indices())
+            if (sw_idx >= begin && sw_idx < route.size()) ++switch_markers;
+        const std::size_t marker_reserve = switch_markers * 2;
         const std::size_t available = target_budget > output.count + marker_reserve
             ? target_budget - output.count - marker_reserve : 0;
         const auto route_budget = std::min<std::size_t>(36, available);
@@ -438,14 +477,14 @@ inline GuidanceGeometry target_geometry(const ReverseTarget &target, const Rever
                             is_pullup_seg ? GuideStyle::tractor : GuideStyle::target,
                             GuideLayer::target_route);
         }
-        if (show_switch_marker)
+        for (const auto sw_idx : target.planner().gear_change_indices())
         {
-            const auto sw = to_ground_frame(
-                route[target.planner().switch_index()].state.tractor, truck_origin);
+            if (sw_idx < begin || sw_idx >= route.size()) continue;
+            const auto sw = to_ground_frame(route[sw_idx].state.tractor, truck_origin);
             add_dashed_edge(output, {sw.x - 0.35, 0, sw.z}, {sw.x + 0.35, 0, sw.z}, 1,
-                            BodyKind::tractor, GuideStyle::straightening, GuideLayer::target_route);
+                            BodyKind::tractor, GuideStyle::preview, GuideLayer::target_route);
             add_dashed_edge(output, {sw.x, 0, sw.z - 0.35}, {sw.x, 0, sw.z + 0.35}, 1,
-                            BodyKind::tractor, GuideStyle::straightening, GuideLayer::target_route);
+                            BodyKind::tractor, GuideStyle::preview, GuideLayer::target_route);
         }
     }
     return output;
