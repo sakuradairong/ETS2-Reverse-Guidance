@@ -18,14 +18,15 @@
 #include <vector>
 
 #include <scssdk_telemetry.h>
-#include <common\scssdk_telemetry_common_configs.h>
-#include <common\scssdk_telemetry_truck_common_channels.h>
-#include <common\scssdk_telemetry_trailer_common_channels.h>
+#include <common/scssdk_telemetry_common_configs.h>
+#include <common/scssdk_telemetry_truck_common_channels.h>
+#include <common/scssdk_telemetry_trailer_common_channels.h>
 #include <MinHook.h>
 
 #include "build_profiles.hpp"
-#include "..\world_runtime\reverse_kinematics.hpp"
-#include "..\world_runtime\reverse_guidance.hpp"
+#include "../world_runtime/reverse_kinematics.hpp"
+#include "../world_runtime/reverse_guidance.hpp"
+#include "../world_runtime/reverse_target.hpp"
 
 namespace
 {
@@ -129,6 +130,7 @@ struct VehicleConfiguration
 {
     scs_value_fvector_t hook{};
     bool hook_valid = false;
+    bool single_chain = false; // missing/unknown chain type disables target planning
     scs_u32_t wheel_count = 0;
     std::array<WheelConfiguration, maximum_config_wheels> wheels{};
 };
@@ -209,6 +211,11 @@ struct Entity
 Telemetry telemetry;
 std::mutex telemetry_configuration_mutex;
 reverse_assist::GuidanceOptions guidance_options;
+bool target_guidance_enabled = true;
+bool target_allow_pullup = true;
+// toggle, confirm, edit, clear, left, right, forward, rearward, rotate left/right
+std::array<int, 10> target_keys{VK_F8, VK_RETURN, VK_BACK, VK_DELETE,
+    VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN, VK_PRIOR, VK_NEXT};
 std::atomic<std::uint64_t> guidance_geometry_revision{};
 Engine engine;
 const reverse_assist::compatibility::BuildProfile *active_build_profile = nullptr;
@@ -1760,9 +1767,20 @@ void load_guidance_options()
     guidance_options.endpoint_outline = flag(L"endpoint_outline", true);
     guidance_options.front_swing = flag(L"front_swing", true);
     guidance_options.articulation_indicator = flag(L"articulation_indicator", true);
+    guidance_options.trailer_corridor = flag(L"trailer_corridor", true);
+    guidance_options.session_latch = flag(L"session_latch", true);
+    guidance_options.jackknife_cues = flag(L"jackknife_cues", true);
     guidance_options.diagnostics = GetPrivateProfileIntW(L"diagnostics", L"enabled", 0, path.c_str()) != 0;
     const auto centimetres = GetPrivateProfileIntW(L"guidance", L"prediction_distance_cm", 500, path.c_str());
     guidance_options.distance = std::clamp(static_cast<double>(centimetres) / 100.0, 2.0, 8.0);
+    const auto corridor_cm = GetPrivateProfileIntW(L"guidance", L"corridor_distance_cm", 600, path.c_str());
+    guidance_options.corridor_distance = std::clamp(static_cast<double>(corridor_cm) / 100.0, 2.0, 8.0);
+    target_guidance_enabled = GetPrivateProfileIntW(L"target", L"enabled", 1, path.c_str()) != 0;
+    target_allow_pullup = GetPrivateProfileIntW(L"target", L"allow_pullup", 1, path.c_str()) != 0;
+    constexpr std::array names{L"toggle_key", L"confirm_key", L"edit_key", L"clear_key",
+        L"left_key", L"right_key", L"forward_key", L"rearward_key", L"rotate_left_key", L"rotate_right_key"};
+    for (std::size_t i = 0; i < target_keys.size(); ++i)
+        target_keys[i] = std::clamp(static_cast<int>(GetPrivateProfileIntW(L"target", names[i], target_keys[i], path.c_str())), 1, 254);
 }
 
 bool initialize_engine()
@@ -1815,22 +1833,56 @@ bool initialize_engine()
         log_line(message.str(), SCS_LOG_TYPE_warning);
         return false;
     }
+    const bool is_162_3_3 = active_build_profile->game_version == "1.62.3.3";
+    const bool is_162_1_0 = active_build_profile->game_version == "1.62.1.0";
+    const bool is_162 = is_162_1_0 || is_162_3_3;
     const bool is_161 = active_build_profile->game_version.rfind("1.61.", 0) == 0;
+    const bool is_modern = is_161 || is_162;
     const bool is_161_1_1 = active_build_profile->game_version == "1.61.1.1";
     const bool is_161_1_9 = active_build_profile->game_version == "1.61.1.9";
-    const auto &new_helpers = reverse_assist::compatibility::verified_161_1_9_model_helpers;
+    const auto &new_helpers = is_162_3_3
+        ? reverse_assist::compatibility::verified_162_3_3_model_helpers
+        : is_162_1_0
+        ? reverse_assist::compatibility::verified_162_1_0_model_helpers
+        : reverse_assist::compatibility::verified_161_1_9_model_helpers;
     const auto model_transfer_161_compat_rva =
-        is_161_1_9 ? new_helpers[0].rva :
+        (is_161_1_9 || is_162) ? new_helpers[0].rva :
         is_161_1_1 ? model_transfer_161_1_1_rva : model_transfer_161_rva;
     const auto model_parameter_init_161_compat_rva =
-        is_161_1_9 ? new_helpers[1].rva :
+        (is_161_1_9 || is_162) ? new_helpers[1].rva :
         is_161_1_1 ? model_parameter_init_161_1_1_rva : model_parameter_init_161_rva;
     const auto set_parent_161_compat_rva =
-        is_161_1_9 ? new_helpers[2].rva :
+        (is_161_1_9 || is_162) ? new_helpers[2].rva :
         is_161_1_1 ? set_parent_161_1_1_rva : set_parent_161_rva;
     const auto set_transform_161_compat_rva =
-        is_161_1_9 ? new_helpers[3].rva :
+        (is_161_1_9 || is_162) ? new_helpers[3].rva :
         is_161_1_1 ? set_transform_161_1_1_rva : set_transform_161_rva;
+    if (is_162)
+    {
+        using namespace reverse_assist::compatibility;
+        constexpr std::array<std::size_t, 3> slots{0x8, 0x90, 0x140};
+        const auto &methods = is_162_3_3
+            ? verified_162_3_3_model_methods : verified_162_1_0_model_methods;
+        const auto vtable_rva = is_162_3_3
+            ? model_vtable_162_3_3_rva : model_vtable_162_1_0_rva;
+        bool layout_matches = is_162_3_3
+            ? model_helpers_162_3_3_match(signature_reader)
+            : model_helpers_162_1_0_match(signature_reader);
+        for (std::size_t i = 0; i < slots.size() && layout_matches; ++i)
+        {
+            const auto expected = reinterpret_cast<std::uintptr_t>(engine.base) +
+                                  methods[i].rva;
+            layout_matches = signature_reader(vtable_rva + slots[i],
+                reinterpret_cast<const std::uint8_t *>(&expected), sizeof(expected));
+        }
+        if (!layout_matches)
+        {
+            log_line("[reverse-entity] Compatibility disabled: " +
+                     std::string(active_build_profile->game_version) +
+                     " model helpers or virtual methods changed; telemetry-only mode active.", SCS_LOG_TYPE_warning);
+            return false;
+        }
+    }
     if (is_161_1_9 &&
         !reverse_assist::compatibility::model_helpers_161_1_9_match(signature_reader))
     {
@@ -1889,26 +1941,26 @@ bool initialize_engine()
 
     engine.model_load = reinterpret_cast<ModelLoad>(
         engine.base + hook_rva(HookId::model_load));
-    engine.model_activate = is_161 ? nullptr : reinterpret_cast<ModelActivate>(engine.base + model_activate_rva);
+    engine.model_activate = is_modern ? nullptr : reinterpret_cast<ModelActivate>(engine.base + model_activate_rva);
     engine.model_transfer = reinterpret_cast<ModelTransfer>(
-        engine.base + (is_161 ? model_transfer_161_compat_rva : model_transfer_rva));
+        engine.base + (is_modern ? model_transfer_161_compat_rva : model_transfer_rva));
     engine.model_parameter_init =
-        reinterpret_cast<ModelParameterInit>(engine.base + (is_161 ? model_parameter_init_161_compat_rva : model_parameter_init_rva));
+        reinterpret_cast<ModelParameterInit>(engine.base + (is_modern ? model_parameter_init_161_compat_rva : model_parameter_init_rva));
     engine.vehicle_accessory_collect =
-        reinterpret_cast<VehicleAccessoryCollect>(
+        is_162 ? nullptr : reinterpret_cast<VehicleAccessoryCollect>(
             engine.base + vehicle_accessory_collect_rva);
-    engine.vehicle_addon_finalize = reinterpret_cast<VehicleAddonFinalize>(
+    engine.vehicle_addon_finalize = is_162 ? nullptr : reinterpret_cast<VehicleAddonFinalize>(
         engine.base + vehicle_addon_finalize_rva);
-    engine.render_entry_populate = reinterpret_cast<RenderEntryPopulate>(
+    engine.render_entry_populate = is_162 ? nullptr : reinterpret_cast<RenderEntryPopulate>(
         engine.base + render_entry_populate_rva);
-    engine.final_base_model_create = reinterpret_cast<FinalBaseModelCreate>(
+    engine.final_base_model_create = is_162 ? nullptr : reinterpret_cast<FinalBaseModelCreate>(
         engine.base + final_base_model_create_rva);
-    engine.final_model_create = reinterpret_cast<FinalModelCreate>(
+    engine.final_model_create = is_162 ? nullptr : reinterpret_cast<FinalModelCreate>(
         engine.base + final_model_create_rva);
-    engine.final_accessory_insert = reinterpret_cast<FinalAccessoryInsert>(
+    engine.final_accessory_insert = is_162 ? nullptr : reinterpret_cast<FinalAccessoryInsert>(
         engine.base + final_accessory_insert_rva);
-    engine.set_parent = reinterpret_cast<SetParent>(engine.base + (is_161 ? set_parent_161_compat_rva : set_parent_rva));
-    engine.set_transform = reinterpret_cast<SetTransform>(engine.base + (is_161 ? set_transform_161_compat_rva : set_transform_rva));
+    engine.set_parent = reinterpret_cast<SetParent>(engine.base + (is_modern ? set_parent_161_compat_rva : set_parent_rva));
+    engine.set_transform = reinterpret_cast<SetTransform>(engine.base + (is_modern ? set_transform_161_compat_rva : set_transform_rva));
     engine.vehicle_render_dispatch =
         reinterpret_cast<VehicleRenderDispatch>(
             engine.base + hook_rva(HookId::vehicle_render_dispatch));
@@ -1922,13 +1974,19 @@ bool initialize_engine()
     log_line("[reverse-entity] Compatibility checks passed for every enabled hook; native entity backend ready.");
     if (trace_all_model_loads && guidance_options.diagnostics)
         log_line("[reverse-entity] Model-path tracing enabled; independent render-model pool available.");
-    log_line("[reverse-entity] Reverse guidance v0.2.2 ready: enabled=" +
+    log_line("[reverse-entity] Reverse guidance v0.3.0-preview.5 ready: enabled=" +
              std::to_string(guidance_options.enabled) + "; endpoint=" +
              std::to_string(guidance_options.endpoint_outline) + "; front_swing=" +
              std::to_string(guidance_options.front_swing) + "; articulation=" +
-             std::to_string(guidance_options.articulation_indicator) + "; diagnostics=" +
+             std::to_string(guidance_options.articulation_indicator) + "; corridor=" +
+             std::to_string(guidance_options.trailer_corridor) + "; session_latch=" +
+             std::to_string(guidance_options.session_latch) + "; jackknife_cues=" +
+             std::to_string(guidance_options.jackknife_cues) + "; pullup_plan=" +
+             std::to_string(target_allow_pullup) + "; diagnostics=" +
              std::to_string(guidance_options.diagnostics) + "; horizon_cm=" +
-             std::to_string(static_cast<int>(guidance_options.distance * 100.0)));
+             std::to_string(static_cast<int>(guidance_options.distance * 100.0)) +
+             "; corridor_cm=" +
+             std::to_string(static_cast<int>(guidance_options.corridor_distance * 100.0)));
     if (single_entity_diagnostic)
         log_line("[reverse-entity] Visibility calibration active: +6.0 m lateral, +2.5 m height.");
     return true;
@@ -2094,7 +2152,22 @@ std::uint64_t *unsafe_create_render_model(
         "/home/ets2_reverse_posture_tmp/model/reverse_assist/sweep_edge.pmd",
         "/home/ets2_reverse_posture_tmp/model/reverse_assist/guide_preview.pmd",
         "/home/ets2_reverse_posture_tmp/model/reverse_assist/guide_straightening.pmd",
-        "/home/ets2_reverse_posture_tmp/model/reverse_assist/guide_steady.pmd"};
+        "/home/ets2_reverse_posture_tmp/model/reverse_assist/guide_steady.pmd",
+        "/home/ets2_reverse_posture_tmp/model/reverse_assist/guide_target.pmd",
+        "/home/ets2_reverse_posture_tmp/model/reverse_assist/cue_off.pmd",
+        "/home/ets2_reverse_posture_tmp/model/reverse_assist/cue_edit.pmd",
+        "/home/ets2_reverse_posture_tmp/model/reverse_assist/cue_wait.pmd",
+        "/home/ets2_reverse_posture_tmp/model/reverse_assist/cue_left.pmd",
+        "/home/ets2_reverse_posture_tmp/model/reverse_assist/cue_right.pmd",
+        "/home/ets2_reverse_posture_tmp/model/reverse_assist/cue_hold.pmd",
+        "/home/ets2_reverse_posture_tmp/model/reverse_assist/cue_straight.pmd",
+        "/home/ets2_reverse_posture_tmp/model/reverse_assist/cue_stop.pmd",
+        "/home/ets2_reverse_posture_tmp/model/reverse_assist/cue_arrived.pmd",
+        "/home/ets2_reverse_posture_tmp/model/reverse_assist/cue_limit.pmd",
+        "/home/ets2_reverse_posture_tmp/model/reverse_assist/cue_move.pmd",
+        "/home/ets2_reverse_posture_tmp/model/reverse_assist/cue_data.pmd",
+        "/home/ets2_reverse_posture_tmp/model/reverse_assist/cue_slow.pmd"};
+    static_assert(paths.size() == static_cast<std::size_t>(reverse_assist::GuideStyle::count));
     const auto style_index = static_cast<std::size_t>(style);
     if (style_index >= paths.size()) return nullptr;
     const char *path = paths[style_index];
@@ -2199,8 +2272,20 @@ bool unsafe_render_independent_prediction_frames(std::uint64_t render_context)
         if (slot >= pool.models.size()) return false;
         if (!pool.models[slot])
         {
+            static std::array<bool, static_cast<std::size_t>(reverse_assist::GuideStyle::count)> missing{};
+            if (style < missing.size() && missing[style]) continue;
             pool.models[slot] = unsafe_create_render_model(frame.style, &frame.transform);
-            if (!pool.models[slot]) return false;
+            if (!pool.models[slot])
+            {
+                // A missing cue must not take down the existing forecast.
+                if (!faulted && engine.enabled && style < missing.size())
+                {
+                    missing[style] = true;
+                    log_line("[reverse-entity] Skipping guidance model that failed to load; style=" +
+                             std::to_string(style) + ".");
+                }
+                continue;
+            }
         }
         if (!unsafe_set_and_render_model(pool.models[slot], &frame.transform, context)) return false;
         ++slot;
@@ -2211,7 +2296,7 @@ bool unsafe_render_independent_prediction_frames(std::uint64_t render_context)
     if (frames.count != 0 && !logged_independent_frame_models.exchange(true, std::memory_order_relaxed))
     {
         log_line("[reverse-entity] Created independent render-only prediction models; active poses=" +
-                 std::to_string(frames.count) + "; guidance v0.2.2.");
+                 std::to_string(frames.count) + "; guidance v0.3.0-preview.5.");
     }
     if (frames.count != 0 && !logged_independent_frame_render.exchange(true, std::memory_order_relaxed))
         log_line("[reverse-entity] Tractor-side independent swept-area rendering is active.");
@@ -2563,7 +2648,12 @@ void update_vehicle_configuration(
              configuration->attributes;
          attribute->name; ++attribute)
     {
-        if (std::strcmp(
+        if (std::strcmp(attribute->name, SCS_TELEMETRY_CONFIG_ATTRIBUTE_chain_type) == 0 &&
+            attribute->value.type == SCS_VALUE_TYPE_string && attribute->value.value_string.value)
+        {
+            next.single_chain = std::strcmp(attribute->value.value_string.value, "single") == 0;
+        }
+        else if (std::strcmp(
                 attribute->name,
                 SCS_TELEMETRY_CONFIG_ATTRIBUTE_hook_position) == 0 &&
             attribute->value.type == SCS_VALUE_TYPE_fvector)
@@ -2680,8 +2770,40 @@ void update_vehicle_configuration(
     log_line(message.str());
 }
 
+reverse_assist::TargetInput read_target_input()
+{
+    static std::array<bool, 10> previous{};
+    static bool was_foreground = false;
+    DWORD foreground_process = 0;
+    GetWindowThreadProcessId(GetForegroundWindow(), &foreground_process);
+    const bool foreground = foreground_process == GetCurrentProcessId();
+    const bool chord = foreground && (GetAsyncKeyState(VK_CONTROL) & 0x8000) &&
+        (GetAsyncKeyState(VK_SHIFT) & 0x8000);
+    // Holding Alt together with Ctrl+Shift switches target editing to coarse steps.
+    const bool coarse = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+    const double translate_step = coarse ? 2.0 : 0.5;
+    const double rotate_step = (coarse ? 15.0 : 5.0) * reverse_assist::pi / 180.0;
+    std::array<bool, 10> down{}, edge{};
+    for (std::size_t i = 0; i < down.size(); ++i)
+    {
+        down[i] = chord && (GetAsyncKeyState(target_keys[i]) & 0x8000);
+        edge[i] = foreground && was_foreground && down[i] && !previous[i];
+    }
+    previous = down; was_foreground = foreground;
+    return {edge[0], edge[1], edge[2], edge[3],
+        (static_cast<int>(edge[5]) - static_cast<int>(edge[4])) * translate_step,
+        (static_cast<int>(edge[7]) - static_cast<int>(edge[6])) * translate_step,
+        (static_cast<int>(edge[9]) - static_cast<int>(edge[8])) * rotate_step};
+}
+
 void update_prediction_frame_targets()
 {
+    static reverse_assist::ReverseTarget target;
+    static reverse_assist::ReverseSessionLatch session_latch;
+    static reverse_assist::Pose previous_world_pose;
+    static bool previous_world_valid = false;
+    target.set_allow_pullup(target_allow_pullup);
+    const auto target_input = read_target_input();
     // Prediction rendering
     // uses plugin-owned model instances so the prediction survives detaching
     // the trailer and every sampled pose keeps its own transform.
@@ -2691,8 +2813,9 @@ void update_prediction_frame_targets()
     };
     if (!guidance_options.enabled || !engine.enabled || faulted ||
         independent_frame_render_disabled.load(std::memory_order_acquire) ||
-        !telemetry.driving || !telemetry.truck_valid || telemetry.gear >= 0)
+        !telemetry.driving || !telemetry.truck_valid)
     {
+        target.reset(); session_latch.reset(); previous_world_valid = false;
         clear_frames();
         return;
     }
@@ -2704,6 +2827,7 @@ void update_prediction_frame_targets()
     if (!finite_placement(telemetry.truck) || !std::isfinite(telemetry.steering) ||
         (telemetry.trailer_connected && telemetry.trailer_valid && !finite_placement(telemetry.trailer)))
     {
+        target.reset(); session_latch.reset(); previous_world_valid = false;
         clear_frames();
         return;
     }
@@ -2728,10 +2852,11 @@ void update_prediction_frame_targets()
     static std::vector<reverse_assist::WheelSpec> truck_wheels;
     static std::vector<reverse_assist::WheelSpec> trailer_wheels;
     static std::vector<reverse_assist::TrailerSpec> trailers;
-    static std::array<double, 21> cached_inputs{};
+    static std::array<double, 25> cached_inputs{};
     static bool cache_valid = false;
     static ULONGLONG last_shape_update = 0;
     static int logged_trend = -1;
+    static int logged_jackknife_risk = 0;
     static ULONGLONG last_trend_log = 0;
     static bool logged_endpoint = false;
     static bool logged_front_swing = false;
@@ -2739,11 +2864,14 @@ void update_prediction_frame_targets()
     const bool revision_changed = previous_revision != revision;
     if (revision_changed)
     {
+        target.reset();
+        session_latch.reset();
         truck_topology_filter.reset();
         trailer_topology_filter.reset();
         cache_valid = false;
         previous_revision = revision;
         logged_trend = -1;
+        logged_jackknife_risk = 0;
         last_trend_log = 0;
         logged_endpoint = false;
         logged_front_swing = false;
@@ -2873,10 +3001,23 @@ void update_prediction_frame_targets()
     }
     else
     {
+        trailer_wheels.clear();
         trailer_topology_filter.reset();
         previous_trailer_wheel_count = 0;
         previous_trailer_hook_z =
             std::numeric_limits<double>::quiet_NaN();
+    }
+    // Neutral and forward driving still has to settle axle contact. F8 is
+    // pressed after stopping, often out of reverse, and a one-frame update
+    // cannot finish the 400 ms topology settle.
+    const bool latched_session = guidance_options.session_latch &&
+        session_latch.update(telemetry.gear, telemetry.speed, telemetry.speed_valid,
+                             telemetry.truck.position.x, telemetry.truck.position.z, now);
+    if (!guidance_options.session_latch) session_latch.reset();
+    if (telemetry.gear >= 0 && !latched_session && !target.active() && !target_input.toggle)
+    {
+        clear_frames();
+        return;
     }
     const auto trailer_geometry = trailers.empty() ? reverse_assist::TrailerSpec{} : trailers.front();
     // Reuse the predictor's measured wheel geometry and tyre-derived planes.
@@ -2886,15 +3027,38 @@ void update_prediction_frame_targets()
         truck_ground_plane, trailers.empty() ? nullptr : &trailer_ground_plane);
     const auto policy = reverse_assist::evaluate_guidance_policy(policy_inputs,
                                                                  guidance_options.distance);
+    const bool pullup_hold = latched_session && session_latch.preview_hold;
+    const bool forward_pullup_preview = pullup_hold && telemetry.gear > 0 && !trailers.empty();
     reverse_assist::GuidanceOptions effective_options = guidance_options;
-    effective_options.enabled = guidance_options.enabled && policy.show;
-    effective_options.endpoint_outline =
-        guidance_options.endpoint_outline && policy.endpoint_outline;
-    // Centimetre quantisation keeps a steady-speed frame from rebuilding the
-    // cached prediction for sub-millimetre horizon changes.
-    effective_options.distance = std::min(guidance_options.distance,
-        std::round(policy.distance * 100.0) / 100.0);
-    const std::array<double, 21> inputs{
+    if (forward_pullup_preview)
+    {
+        effective_options.enabled = guidance_options.enabled;
+        effective_options.endpoint_outline = false;
+        effective_options.distance = std::min(
+            guidance_options.distance,
+            reverse_assist::ReverseSessionLatch::preview_hold_horizon_m);
+    }
+    else if (pullup_hold)
+    {
+        effective_options.enabled = guidance_options.enabled && policy.show;
+        effective_options.endpoint_outline =
+            guidance_options.endpoint_outline && policy.endpoint_outline;
+        effective_options.distance = std::min({
+            guidance_options.distance,
+            std::round(policy.distance * 100.0) / 100.0,
+            reverse_assist::ReverseSessionLatch::preview_hold_horizon_m});
+    }
+    else
+    {
+        effective_options.enabled = guidance_options.enabled && policy.show && telemetry.gear < 0;
+        effective_options.endpoint_outline =
+            guidance_options.endpoint_outline && policy.endpoint_outline;
+        // Centimetre quantisation keeps a steady-speed frame from rebuilding the
+        // cached prediction for sub-millimetre horizon changes.
+        effective_options.distance = std::min(guidance_options.distance,
+            std::round(policy.distance * 100.0) / 100.0);
+    }
+    const std::array<double, 25> inputs{
         telemetry.steering, tractor_geometry.front_axle_steering,
         tractor_geometry.wheelbase, tractor_geometry.length, tractor_geometry.width,
         tractor_geometry.rear_axle_x, tractor_geometry.rear_axle_z,
@@ -2904,7 +3068,11 @@ void update_prediction_frame_targets()
         trailer_geometry.rear_overhang, trailer_geometry.width, trailer_geometry.axle_steering,
         effective_options.distance, static_cast<double>(effective_options.endpoint_outline),
         static_cast<double>(effective_options.front_swing),
-        static_cast<double>(effective_options.enabled), static_cast<double>(policy.show)};
+        static_cast<double>(effective_options.enabled), static_cast<double>(policy.show),
+        static_cast<double>(effective_options.trailer_corridor),
+        effective_options.corridor_distance,
+        static_cast<double>(forward_pullup_preview),
+        static_cast<double>(pullup_hold)};
     bool changed = !cache_valid;
     for (std::size_t index = 0; index < inputs.size() && !changed; ++index)
     {
@@ -2915,15 +3083,32 @@ void update_prediction_frame_targets()
     const bool attachment_changed = !cache_valid || inputs[10] != cached_inputs[10];
     if (changed && (attachment_changed || revision_changed || now - last_shape_update >= 33))
     {
-        reverse_assist::predict_reverse_boxes_into(cached_prediction,
-            telemetry.steering, tractor_geometry.wheelbase, tractor_geometry.length,
-            tractor_geometry.width, trailers, tractor_geometry.rear_axle_x,
-            tractor_geometry.rear_axle_z, tractor_geometry.center_from_rear,
-            effective_options.distance, 0.05, 0.25, tractor_geometry.hook_from_rear,
-            tractor_geometry.hook_right_from_rear, tractor_geometry.front_axle_steering,
-            &axle_workspace);
-        cached_guidance = reverse_assist::build_reverse_guidance(cached_prediction,
-                                                               tractor_geometry, effective_options);
+        const reverse_assist::TrailerSpec *primary_trailer =
+            trailers.empty() ? nullptr : &trailer_geometry;
+        if (forward_pullup_preview)
+        {
+            reverse_assist::predict_motion_boxes_into(cached_prediction,
+                telemetry.steering, tractor_geometry.wheelbase, tractor_geometry.length,
+                tractor_geometry.width, trailers, tractor_geometry.rear_axle_x,
+                tractor_geometry.rear_axle_z, tractor_geometry.center_from_rear,
+                effective_options.distance, 0.05, 0.25, tractor_geometry.hook_from_rear,
+                tractor_geometry.hook_right_from_rear, tractor_geometry.front_axle_steering,
+                &axle_workspace, true);
+            cached_guidance = reverse_assist::build_pullup_guidance(
+                cached_prediction, tractor_geometry, effective_options, primary_trailer);
+        }
+        else
+        {
+            reverse_assist::predict_reverse_boxes_into(cached_prediction,
+                telemetry.steering, tractor_geometry.wheelbase, tractor_geometry.length,
+                tractor_geometry.width, trailers, tractor_geometry.rear_axle_x,
+                tractor_geometry.rear_axle_z, tractor_geometry.center_from_rear,
+                effective_options.distance, 0.05, 0.25, tractor_geometry.hook_from_rear,
+                tractor_geometry.hook_right_from_rear, tractor_geometry.front_axle_steering,
+                &axle_workspace);
+            cached_guidance = reverse_assist::build_reverse_guidance(
+                cached_prediction, tractor_geometry, effective_options, primary_trailer);
+        }
         cached_inputs = inputs;
         cache_valid = true;
         last_shape_update = now;
@@ -2941,23 +3126,106 @@ void update_prediction_frame_targets()
         }
         if (cached_guidance.truncated)
             log_line("[reverse-entity] Guidance geometry exceeded its segment budget.", SCS_LOG_TYPE_warning);
+        const int risk_code = static_cast<int>(cached_guidance.jackknife_risk);
         if (!trailers.empty() && guidance_options.articulation_indicator &&
-            logged_trend != static_cast<int>(cached_guidance.trend) &&
+            (logged_trend != static_cast<int>(cached_guidance.trend) ||
+             logged_jackknife_risk != risk_code) &&
             (logged_trend == -1 || now - last_trend_log >= 1000))
         {
             constexpr std::array trend_names{"steady", "straightening", "folding"};
+            constexpr std::array risk_names{"none", "caution", "critical"};
             std::ostringstream message;
             message << std::fixed << std::setprecision(1)
                     << "[reverse-entity] Guidance articulation: current_deg="
-                    << cached_guidance.articulation_degrees << " forecast_1m_deg="
-                    << cached_guidance.predicted_articulation_degrees << " trend="
-                    << trend_names[static_cast<std::size_t>(cached_guidance.trend)] << ".";
+                    << cached_guidance.articulation_degrees << " forecast_deg="
+                    << cached_guidance.predicted_articulation_degrees << " crit_deg="
+                    << cached_guidance.jackknife_critical_degrees << " trend="
+                    << trend_names[static_cast<std::size_t>(cached_guidance.trend)]
+                    << " risk=" << risk_names[static_cast<std::size_t>(cached_guidance.jackknife_risk)]
+                    << (forward_pullup_preview ? " mode=pullup." : ".");
             log_line(message.str());
             logged_trend = static_cast<int>(cached_guidance.trend);
+            logged_jackknife_risk = risk_code;
             last_trend_log = now;
         }
     }
     if (!cache_valid) return;
+    const reverse_assist::Pose world_origin{telemetry.truck.position.x, telemetry.truck.position.z, truck_heading};
+    // Scene/config revision, disconnect, invalid placement or teleport must not
+    // leave a goal/route referring to a different vehicle or location.
+    if (!telemetry.trailer_connected || !telemetry.trailer_valid || !target_guidance_enabled ||
+        (previous_world_valid && std::hypot(world_origin.x - previous_world_pose.x,
+                                           world_origin.z - previous_world_pose.z) > 5.0))
+        target.reset();
+    previous_world_pose = world_origin; previous_world_valid = true;
+    static double previous_target_axle_x = 0, previous_target_axle_z = 0;
+    if (target.active() && std::hypot(tractor_geometry.rear_axle_x - previous_target_axle_x,
+                                    tractor_geometry.rear_axle_z - previous_target_axle_z) > 0.05)
+        target.reset();
+    previous_target_axle_x = tractor_geometry.rear_axle_x;
+    previous_target_axle_z = tractor_geometry.rear_axle_z;
+    reverse_assist::ReverseState target_state;
+    target_state.tractor = reverse_assist::from_ground_frame(
+        {tractor_geometry.rear_axle_x, tractor_geometry.rear_axle_z, 0}, world_origin);
+    target_state.trailer_heading = trailer_heading;
+    target_state.steering = tractor_geometry.front_axle_steering;
+    const reverse_assist::ReverseRig rig{tractor_geometry.wheelbase, tractor_geometry.hook_from_rear,
+        tractor_geometry.hook_right_from_rear, trailer_geometry.axle_to_hitch,
+        trailer_geometry.rear_overhang, trailer_geometry.width};
+    const bool measured_target_wheels = reverse_assist::target_wheels_supported(truck_wheels, trailer_wheels,
+        truck_configuration.hook.x, truck_configuration.hook.z, trailer_configuration.hook.x, trailer_configuration.hook.z);
+    // Planning uses the settled geometry. A flickering on_ground bit or a
+    // tyre plane that falls back to body attitude must not hide that geometry
+    // behind the data cue. Slope and the measured wheel angle remain the gates.
+    const bool target_supported = target_guidance_enabled && telemetry.trailer_connected && telemetry.trailer_valid &&
+        truck_configuration.hook_valid && trailer_configuration.hook_valid && trailer_configuration.single_chain &&
+        measured_target_wheels && trailer_topology_filter.valid() &&
+        std::isfinite(policy_inputs.slope_degrees) && policy_inputs.slope_degrees <= 4.0 &&
+        std::isfinite(target_state.steering) &&
+        std::abs(target_state.steering) <= reverse_assist::PlannerLimits{}.maximum_steering;
+    target.update(target_state, rig, telemetry.speed_valid ? telemetry.speed :
+        std::numeric_limits<double>::quiet_NaN(), telemetry.gear < 0, target_supported, now, target_input);
+    if (target_input.toggle && target.cue() == reverse_assist::TargetCue::data)
+    {
+        std::ostringstream message;
+        message << std::fixed << std::setprecision(1)
+                << "[reverse-target] DATA: single_chain=" << trailer_configuration.single_chain
+                << " trailer=" << (telemetry.trailer_connected && telemetry.trailer_valid)
+                << " hooks=" << (truck_configuration.hook_valid && trailer_configuration.hook_valid)
+                << " wheels=" << measured_target_wheels
+                << " topology=" << trailer_topology_filter.valid()
+                << " slope_deg=" << policy_inputs.slope_degrees
+                << " steer_deg=" << target_state.steering * 180.0 / reverse_assist::pi
+                << " artic_deg=" << reverse_assist::articulation(target_state) * 180.0 / reverse_assist::pi
+                << " speed_valid=" << telemetry.speed_valid;
+        log_line(message.str());
+    }
+    static reverse_assist::TargetCue logged_target_cue = reverse_assist::TargetCue::off;
+    if (target.cue() != logged_target_cue)
+    {
+        log_line(std::string("[reverse-target] ") + reverse_assist::cue_name(target.cue()) +
+            "; plan_status=" + std::to_string(static_cast<int>(target.planner().status())) +
+            "; expansions=" + std::to_string(target.planner().expansions()) +
+            "; route is kinematic only, obstacles are not observed.");
+        logged_target_cue = target.cue();
+    }
+    // Target has a reserved first share of the same fixed rendering budget.
+    auto display = reverse_assist::target_geometry(target, rig, world_origin);
+    // When manual target guidance is idle, reuse existing side cue models for
+    // real-time jackknife recovery advice (counter-steer or pull forward).
+    if (!target.active() && target.cue() == reverse_assist::TargetCue::off &&
+        guidance_options.jackknife_cues && !forward_pullup_preview &&
+        cached_guidance.jackknife_advice != reverse_assist::JackknifeAdvice::none)
+    {
+        const auto advice_cue =
+            cached_guidance.jackknife_advice == reverse_assist::JackknifeAdvice::pull_forward
+                ? reverse_assist::TargetCue::move
+                : (cached_guidance.jackknife_advice == reverse_assist::JackknifeAdvice::countersteer_left
+                       ? reverse_assist::TargetCue::left
+                       : reverse_assist::TargetCue::right);
+        reverse_assist::place_side_cue(display, advice_cue, tractor_geometry.width);
+    }
+    reverse_assist::append_current_guidance(display, cached_guidance);
     const double truck_sin = std::sin(truck_heading), truck_cos = std::cos(truck_heading);
     const double trailer_sin = std::sin(trailer_heading), trailer_cos = std::cos(trailer_heading);
     const auto project = [&](reverse_assist::BoundaryPoint point, reverse_assist::BodyKind body) {
@@ -2975,9 +3243,9 @@ void update_prediction_frame_targets()
             anchor.position.y + 0.35 + reverse_assist::ground_plane_height(local_x, local_z, plane), world_z};
     };
     PredictionFrameSet frames{};
-    for (std::size_t index = 0; index < cached_guidance.count; ++index)
+    for (std::size_t index = 0; index < display.count; ++index)
     {
-        const auto &segment = cached_guidance.segments[index];
+        const auto &segment = display.segments[index];
         const auto from = project(segment.from, segment.body);
         const auto to = project(segment.to, segment.body);
         const double dx = to.x - from.x, dy = to.y - from.y, dz = to.z - from.z;

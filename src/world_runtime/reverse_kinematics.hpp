@@ -600,23 +600,76 @@ inline double trailer_heading_from_hitch_displacement(
     return estimate;
 }
 
-inline void predict_reverse_boxes_into(Prediction &result,
-                                         double steering_input,
-                                        double wheelbase,
-                                        double tractor_length,
-                                        double tractor_width,
-                                        const std::vector<TrailerSpec> &trailers,
-                                        double rear_axle_x = 0.0,
-                                        double rear_axle_z = 0.0,
-                                        double tractor_center_from_rear = -2.4,
-                                        double distance = 12.0,
-                                        double integration_step = 0.10,
-                                        double box_spacing = 1.0,
-                                        double tractor_hitch_from_rear = 0.0,
-                                        double tractor_hitch_right_from_rear = 0.0,
-                                        double measured_front_steer_angle =
-                                            std::numeric_limits<double>::quiet_NaN(),
-                                        std::vector<Pose> *axle_workspace = nullptr)
+// Heading points rearward in the SDK ground frame. Positive road-wheel
+// steering turns the tractor's rearward heading negatively while reversing.
+// Positive signed_distance moves rearward (reverse), negative moves forward.
+inline Pose tractor_motion_step(Pose previous, double curvature, double signed_distance)
+{
+    const double delta = -curvature * signed_distance;
+    const double midpoint = previous.heading + delta * 0.5;
+    previous.x += std::sin(midpoint) * signed_distance;
+    previous.z += std::cos(midpoint) * signed_distance;
+    previous.heading = normalize_angle(previous.heading + delta);
+    return previous;
+}
+
+inline Pose reverse_tractor_step(Pose previous, double curvature, double distance)
+{
+    return tractor_motion_step(previous, curvature, distance);
+}
+
+// Analytical jackknife critical articulation angle (radians) for a tractor +
+// single semi-trailer while reversing. Beyond this angle, even full counter-
+// steering at recoverable_steering cannot reduce |articulation| while moving
+// rearward without pulling forward.
+inline double jackknife_critical_angle(double wheelbase,
+                                       double hook_from_rear,
+                                       double axle_to_hitch,
+                                       double recoverable_steering = 30.0 * pi / 180.0)
+{
+    wheelbase = std::clamp(wheelbase, 2.4, 6.8);
+    axle_to_hitch = std::clamp(axle_to_hitch, 2.0, 14.0);
+    recoverable_steering = std::clamp(std::abs(recoverable_steering),
+                                      15.0 * pi / 180.0, 45.0 * pi / 180.0);
+    const double max_curv = std::tan(recoverable_steering) / wheelbase;
+    // Equilibrium d(gamma)/ds = 0: sin(g) + (h * k_max) * cos(g) = L2 * k_max
+    const double a = 1.0;
+    const double b = hook_from_rear * max_curv;
+    const double c = axle_to_hitch * max_curv;
+    const double r = std::hypot(a, b);
+    const double max_practical = 62.0 * pi / 180.0;
+    const double min_practical = 25.0 * pi / 180.0;
+    if (r <= 1e-6 || c >= r)
+        return max_practical;
+    const double raw = std::asin(std::clamp(c / r, -1.0, 1.0)) - std::atan2(b, a);
+    return std::clamp(raw, min_practical, max_practical);
+}
+
+inline Pose tractor_hitch(Pose tractor, double rearward, double rightward)
+{
+    tractor.x += std::sin(tractor.heading) * rearward + std::cos(tractor.heading) * rightward;
+    tractor.z += std::cos(tractor.heading) * rearward - std::sin(tractor.heading) * rightward;
+    return tractor;
+}
+
+inline void predict_motion_boxes_into(Prediction &result,
+                                      double steering_input,
+                                      double wheelbase,
+                                      double tractor_length,
+                                      double tractor_width,
+                                      const std::vector<TrailerSpec> &trailers,
+                                      double rear_axle_x = 0.0,
+                                      double rear_axle_z = 0.0,
+                                      double tractor_center_from_rear = -2.4,
+                                      double distance = 12.0,
+                                      double integration_step = 0.10,
+                                      double box_spacing = 1.0,
+                                      double tractor_hitch_from_rear = 0.0,
+                                      double tractor_hitch_right_from_rear = 0.0,
+                                      double measured_front_steer_angle =
+                                          std::numeric_limits<double>::quiet_NaN(),
+                                      std::vector<Pose> *axle_workspace = nullptr,
+                                      bool forward = false)
 {
     result.boxes.clear();
     wheelbase = std::clamp(wheelbase, 2.4, 6.8);
@@ -633,6 +686,7 @@ inline void predict_reverse_boxes_into(Prediction &result,
                      -60.0 * pi / 180.0, 60.0 * pi / 180.0)
         : std::clamp(steering_input, -1.0, 1.0) * 38.0 * pi / 180.0;
     const double curvature = std::tan(steer_angle) / wheelbase;
+    const double signed_step = forward ? -integration_step : integration_step;
 
     Pose tractor{rear_axle_x, rear_axle_z, 0.0};
     std::vector<Pose> local_trailer_axles;
@@ -678,16 +732,7 @@ inline void predict_reverse_boxes_into(Prediction &result,
     for (double travelled = integration_step; travelled <= distance + 1e-6; travelled += integration_step)
     {
         const Pose previous_tractor = tractor;
-        const double heading_delta =
-            -curvature * integration_step;
-        const double midpoint_heading =
-            previous_tractor.heading + heading_delta * 0.5;
-        tractor.x += std::sin(midpoint_heading) *
-            integration_step;
-        tractor.z += std::cos(midpoint_heading) *
-            integration_step;
-        tractor.heading = normalize_angle(
-            previous_tractor.heading + heading_delta);
+        tractor = tractor_motion_step(previous_tractor, curvature, signed_step);
 
         Pose previous_parent = previous_tractor;
         previous_parent.x +=
@@ -736,7 +781,30 @@ inline void predict_reverse_boxes_into(Prediction &result,
             next_box += box_spacing;
         }
     }
+}
 
+inline void predict_reverse_boxes_into(Prediction &result,
+                                       double steering_input,
+                                       double wheelbase,
+                                       double tractor_length,
+                                       double tractor_width,
+                                       const std::vector<TrailerSpec> &trailers,
+                                       double rear_axle_x = 0.0,
+                                       double rear_axle_z = 0.0,
+                                       double tractor_center_from_rear = -2.4,
+                                       double distance = 12.0,
+                                       double integration_step = 0.10,
+                                       double box_spacing = 1.0,
+                                       double tractor_hitch_from_rear = 0.0,
+                                       double tractor_hitch_right_from_rear = 0.0,
+                                       double measured_front_steer_angle =
+                                           std::numeric_limits<double>::quiet_NaN(),
+                                       std::vector<Pose> *axle_workspace = nullptr)
+{
+    predict_motion_boxes_into(result, steering_input, wheelbase, tractor_length,
+        tractor_width, trailers, rear_axle_x, rear_axle_z, tractor_center_from_rear,
+        distance, integration_step, box_spacing, tractor_hitch_from_rear,
+        tractor_hitch_right_from_rear, measured_front_steer_angle, axle_workspace, false);
 }
 
 inline Prediction predict_reverse_boxes(double steering_input,

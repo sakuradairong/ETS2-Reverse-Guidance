@@ -59,8 +59,11 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="build_profiles.hpp" />
+    <ClInclude Include="..\world_runtime\chinese_cues.hpp" />
     <ClInclude Include="..\world_runtime\reverse_kinematics.hpp" />
     <ClInclude Include="..\world_runtime\reverse_guidance.hpp" />
+    <ClInclude Include="..\world_runtime\reverse_planner.hpp" />
+    <ClInclude Include="..\world_runtime\reverse_target.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

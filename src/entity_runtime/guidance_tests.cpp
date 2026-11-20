@@ -155,7 +155,8 @@ int main(int argc, char **argv)
     check_geometry(solo);
     check(solo.endpoint_segments == 0 && solo.articulation_segments == 0,
           "detached trailer has no stale endpoint or articulation marker");
-    options.endpoint_outline = options.front_swing = options.articulation_indicator = false;
+    options.endpoint_outline = options.front_swing = options.articulation_indicator =
+        options.trailer_corridor = false;
     const auto baseline = build_reverse_guidance(straight_prediction, tractor, options);
     check(baseline.count == 80, "feature switches retain the original rear-corner tracks");
     options.enabled = false;
@@ -311,6 +312,93 @@ int main(int argc, char **argv)
     user_disabled.enabled = false;
     check(build_reverse_guidance(straight_prediction, tractor, user_disabled).count == 0,
           "hidden guidance publishes empty geometry");
+
+    // Trailer corridor toggle and distance clamping.
+    {
+        GuidanceOptions corridor_on;
+        corridor_on.endpoint_outline = corridor_on.front_swing = corridor_on.articulation_indicator = false;
+        corridor_on.trailer_corridor = true;
+        corridor_on.corridor_distance = 6.0;
+        const auto with_corridor = build_reverse_guidance(straight_prediction, tractor, corridor_on, &trailers.front());
+        check(with_corridor.corridor_segments == 10 && with_corridor.count == 90,
+              "trailer corridor adds ten steady reference segments behind the trailer");
+        corridor_on.trailer_corridor = false;
+        const auto without_corridor = build_reverse_guidance(straight_prediction, tractor, corridor_on, &trailers.front());
+        check(without_corridor.corridor_segments == 0 && without_corridor.count == 80,
+              "disabling trailer corridor removes only corridor segments");
+    }
+
+    // Analytical jackknife critical angle, risk tiers and recovery advice.
+    {
+        const double short_trailer_crit = jackknife_critical_angle(3.8, -0.5, 4.5);
+        const double long_trailer_crit = jackknife_critical_angle(3.8, -0.5, 9.5);
+        check(long_trailer_crit > short_trailer_crit,
+              "longer trailer hitch-to-axle length allows a larger recoverable articulation");
+
+        const std::vector<TrailerSpec> caution_right{{36.0 * pi / 180.0, 5.0, 2.0, 2.55}};
+        const auto caution_geom = build_reverse_guidance(
+            forecast(0.0, tractor, caution_right), tractor, options, &caution_right.front());
+        check(caution_geom.jackknife_risk == JackknifeRisk::caution &&
+              caution_geom.jackknife_advice == JackknifeAdvice::countersteer_right,
+              "folding positive articulation in caution zone advises counter-steering right");
+
+        const std::vector<TrailerSpec> caution_left{{-36.0 * pi / 180.0, 5.0, 2.0, 2.55}};
+        const auto caution_left_geom = build_reverse_guidance(
+            forecast(0.0, tractor, caution_left), tractor, options, &caution_left.front());
+        check(caution_left_geom.jackknife_risk == JackknifeRisk::caution &&
+              caution_left_geom.jackknife_advice == JackknifeAdvice::countersteer_left,
+              "folding negative articulation in caution zone advises counter-steering left");
+
+        const std::vector<TrailerSpec> critical_fold{{58.0 * pi / 180.0, 5.0, 2.0, 2.55}};
+        const auto critical_geom = build_reverse_guidance(
+            forecast(0.0, tractor, critical_fold), tractor, options, &critical_fold.front());
+        check(critical_geom.jackknife_risk == JackknifeRisk::critical &&
+              critical_geom.jackknife_advice == JackknifeAdvice::pull_forward,
+              "critical articulation beyond recovery threshold advises pulling forward");
+        check(critical_geom.jackknife_critical_degrees < 55.0,
+              "explicit TrailerSpec supplies measured axle_to_hitch for critical angle");
+    }
+
+    // ReverseSessionLatch keeps guidance alive across brief neutral/forward pull-ups.
+    {
+        ReverseSessionLatch latch;
+        check(!latch.update(1, 1.0, true, 0.0, 0.0, 1000),
+              "forward driving before reversing does not latch");
+        check(latch.update(-1, -0.5, true, 10.0, 20.0, 2000) && !latch.preview_hold,
+              "reverse gear engages latch without preview hold");
+        check(latch.update(0, 0.0, true, 10.0, 20.0, 4000) && latch.preview_hold,
+              "neutral pause enters preview hold");
+        check(latch.update(1, 1.5, true, 10.0, 15.0, 7000) && latch.preview_hold,
+              "low-speed short forward pull-up preserves preview hold");
+        check(!latch.update(1, 3.0, true, 10.0, 14.0, 8000) && !latch.engaged,
+              "faster forward driving releases session latch");
+        check(latch.update(-1, -0.5, true, 0.0, 0.0, 9000), "re-engaging reverse re-latches");
+        check(!latch.update(0, 0.0, true, 0.0, 0.0, 30000),
+              "session latch expires after timeout");
+        check(latch.update(-1, -0.5, true, 0.0, 0.0, 31000), "re-engaging reverse re-latches again");
+        check(!latch.update(1, 1.0, true, 0.0, -13.0, 32000),
+              "moving more than 12 m from reverse anchor releases latch");
+    }
+
+    // Forward pull-up prediction shows trailer straightening and stays bounded.
+    {
+        Prediction fwd_prediction;
+        const std::vector<TrailerSpec> folded_trailer{{35.0 * pi / 180.0, 7.2, 3.0, 2.55}};
+        predict_motion_boxes_into(fwd_prediction, 0.0, tractor.wheelbase, tractor.length,
+            tractor.width, folded_trailer, tractor.rear_axle_x, tractor.rear_axle_z,
+            tractor.center_from_rear, 4.5, 0.05, 0.25, tractor.hook_from_rear,
+            tractor.hook_right_from_rear, 0.0, nullptr, true);
+        const auto pullup_geom = build_pullup_guidance(
+            fwd_prediction, tractor, options, &folded_trailer.front());
+        check_geometry(pullup_geom);
+        check(pullup_geom.count > 40 && pullup_geom.corridor_segments > 0 &&
+              pullup_geom.articulation_segments > 0,
+              "forward pull-up guidance draws tracks, corridor and articulation indicator");
+        check(pullup_geom.trend == ArticulationTrend::straightening &&
+              std::abs(pullup_geom.predicted_articulation_degrees) <
+                  std::abs(pullup_geom.articulation_degrees) - 5.0,
+              "pulling forward straightens a folded trailer articulation");
+    }
     if (argc == 2)
     {
         std::ofstream stream(argv[1]);
