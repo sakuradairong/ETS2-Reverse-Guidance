@@ -71,6 +71,7 @@ GUIDANCE_COLORS = {
     "preview": (255, 207, 154, 255),
     "straightening": (48, 222, 100, 255),
     "steady": (210, 220, 224, 255),
+    "target": (0, 224, 232, 255),
 }
 for _style in GUIDANCE_COLORS:
     PACKAGE_FILES.extend([
@@ -288,7 +289,8 @@ def cmd_guidance_assets():
                 stream.write(blob)
         shutil.copyfile(os.path.join(model_dir, "sweep_edge.pmg"),
                         os.path.join(model_dir, basename + ".pmg"))
-    print("guidance-assets: generated 3 styles / 15 files")
+    print("guidance-assets: generated %d styles / %d files" %
+          (len(GUIDANCE_COLORS), len(GUIDANCE_COLORS) * 5))
     return 0
 
 
@@ -375,7 +377,10 @@ def cmd_package():
     dst = os.path.join(dst_dir, "ETS2ReverseEntityRuntime.dll")
     shutil.copyfile(src, dst)
     ini = os.path.join(dst_dir, "ETS2ReverseEntityRuntime.ini")
-    if not os.path.exists(ini):
+    config_ini = os.path.join(ROOT, "config", "ETS2ReverseEntityRuntime.ini")
+    if os.path.exists(config_ini):
+        shutil.copyfile(config_ini, ini)
+    elif not os.path.exists(ini):
         with open(ini, "w", encoding="ascii") as stream:
             stream.write("[guidance]\nenabled=1\nendpoint_outline=1\nfront_swing=1\n"
                          "articulation_indicator=1\nprediction_distance_cm=500\n"

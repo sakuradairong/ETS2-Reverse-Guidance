@@ -10,11 +10,11 @@ Push-Location $buildRoot
 try {
     & $python tools/rpt_tool.py prepare
     if ($LASTEXITCODE -ne 0) { throw 'Asset preparation failed.' }
-    foreach ($project in @('ETS2ReverseEntityRuntime', 'GuidanceTests', 'BuildProfileTests')) {
+    foreach ($project in @('ETS2ReverseEntityRuntime', 'GuidanceTests', 'PlannerTests', 'BuildProfileTests')) {
         & $msbuild "src/entity_runtime/$project.vcxproj" /nologo /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
         if ($LASTEXITCODE -ne 0) { throw "$project build failed." }
     }
-    foreach ($test in @('build/guidance_tests/GuidanceTests.exe', 'build/entity_runtime_tests/BuildProfileTests.exe')) {
+    foreach ($test in @('build/guidance_tests/GuidanceTests.exe', 'build/planner_tests/PlannerTests.exe', 'build/entity_runtime_tests/BuildProfileTests.exe')) {
         & "./$test"
         if ($LASTEXITCODE -ne 0) { throw "$test failed." }
     }
